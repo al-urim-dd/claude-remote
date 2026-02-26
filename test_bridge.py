@@ -398,5 +398,28 @@ class TestListSessionsSlug:
         # The corrected code won't find the wrong-slug directory
         assert result == "No sessions found."
 
+
+# ---------------------------------------------------------------------------
+# /help command
+# ---------------------------------------------------------------------------
+
+
+class TestHelpCommand:
+    """Verify HELP_TEXT contains key commands and capabilities."""
+
+    def test_help_text_contains_commands(self):
+        assert "/help" in bridge.HELP_TEXT
+        assert "/sessions" in bridge.HELP_TEXT
+        assert "/resume" in bridge.HELP_TEXT
+        assert "/cancel" in bridge.HELP_TEXT
+
+    def test_help_text_contains_capabilities(self):
+        assert "Attachments" in bridge.HELP_TEXT
+        assert "Multi-turn" in bridge.HELP_TEXT
+        assert "Google Workspace" in bridge.HELP_TEXT
+
+    def test_help_command_recognized(self):
+        body = bridge.strip_quoted_reply("/help")
+        assert body.lower() == "/help"
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

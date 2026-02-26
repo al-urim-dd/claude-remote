@@ -60,6 +60,19 @@ ATTACHMENT_MAX_AGE_HOURS = 24
 PROGRESS_INTERVAL = 120  # seconds between "still working" emails
 CLAUDE_SESSIONS_DIR = Path.home() / ".claude" / "projects"
 
+HELP_TEXT = """\
+Available commands and capabilities:
+
+/help — Show this help message
+/sessions — List recent Claude Code sessions
+/resume <session-id> — Resume a specific session
+/cancel — Cancel a running task (coming soon)
+
+Regular messages — Sent to Claude Code for processing
+Attachments — Attach files to emails and Claude will analyze them
+Calendar, email, docs — Claude has access to Google Workspace tools
+Multi-turn — Reply in the same thread to continue a conversation"""
+
 # ---------------------------------------------------------------------------
 # Logging
 # ---------------------------------------------------------------------------
@@ -613,7 +626,16 @@ def _poll_cycle(
         thread_id = msg["thread_id"]
         log.info("Processing message %s in thread %s: %.80s", msg_id, thread_id, body)
 
-        # Built-in commands: /sessions and /resume <id>
+        # Built-in commands: /help, /sessions, and /resume <id>
+        if body.lower().strip() == "/help":
+            response = HELP_TEXT
+            send_reply(service, msg, response, my_email)
+            mark_as_read(service, msg_id)
+            processed_ids.add(msg_id)
+            save_processed_id(msg_id)
+            continue
+
+        # /sessions and /resume <id>
         if body.lower().strip() == "/sessions":
             response = list_sessions()
             send_reply(service, msg, response, my_email)
