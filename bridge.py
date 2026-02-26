@@ -56,6 +56,7 @@ REPLY_SENDER_NAME = "ClaudeRemote"  # Display name on reply emails
 ATTACHMENTS_DIR = CONFIG_DIR / "attachments"
 MAX_ATTACHMENT_SIZE = 10 * 1024 * 1024  # 10 MB
 ATTACHMENT_MAX_AGE_HOURS = 24
+PROGRESS_INTERVAL = 120  # seconds between "still working" emails
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -326,8 +327,13 @@ def mark_as_read(service, msg_id: str):
 # ---------------------------------------------------------------------------
 
 
-def invoke_claude(message: str, session_id: str, resume: bool = False) -> str:
-    """Run claude -p as a subprocess and return the output."""
+def invoke_claude(
+    message: str,
+    session_id: str,
+    resume: bool = False,
+    on_progress: callable = None,
+) -> str:
+    """Run claude -p as a subprocess, sending progress callbacks while waiting."""
     env = os.environ.copy()
     env.pop("CLAUDECODE", None)  # Strip nested session guard
 
@@ -341,22 +347,30 @@ def invoke_claude(message: str, session_id: str, resume: bool = False) -> str:
     log.info("Invoking Claude (resume=%s, session=%s)", resume, session_id[:8])
 
     try:
-        result = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            timeout=CLAUDE_TIMEOUT,
-            env=env,
-            cwd=CLAUDE_CWD,
+        proc = subprocess.Popen(
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True, env=env, cwd=CLAUDE_CWD,
         )
-        output = result.stdout.strip()
-        if result.returncode != 0 and not output:
-            output = f"[Claude exited with code {result.returncode}]\n{result.stderr.strip()}"
-        if not output:
-            output = "[Claude returned empty output]"
-    except subprocess.TimeoutExpired:
-        output = f"[Claude timed out after {CLAUDE_TIMEOUT}s]"
-        log.warning("Claude timed out for session %s", session_id[:8])
+        elapsed = 0
+        next_progress = PROGRESS_INTERVAL
+        while proc.poll() is None:
+            time.sleep(1)
+            elapsed += 1
+            if elapsed >= CLAUDE_TIMEOUT:
+                proc.kill()
+                proc.wait()
+                output = f"[Claude timed out after {CLAUDE_TIMEOUT}s]"
+                log.warning("Claude timed out for session %s", session_id[:8])
+                break
+            if on_progress and elapsed >= next_progress:
+                on_progress(elapsed)
+                next_progress += PROGRESS_INTERVAL
+        else:
+            output = proc.stdout.read().strip()
+            if proc.returncode != 0 and not output:
+                output = f"[Claude exited with code {proc.returncode}]\n{proc.stderr.read().strip()}"
+            if not output:
+                output = "[Claude returned empty output]"
     except FileNotFoundError:
         output = "[Error: 'claude' command not found. Is Claude Code installed?]"
         log.error("claude command not found")
@@ -556,8 +570,17 @@ def _poll_cycle(
             else:
                 prompt = att_preamble + body
 
+        # Progress callback: send "still working" emails while Claude runs
+        def on_progress(elapsed_secs):
+            mins = elapsed_secs // 60
+            try:
+                send_reply(service, msg, f"[Still working... ({mins}m elapsed)]", my_email)
+                log.info("Sent progress update at %ds for message %s", elapsed_secs, msg_id)
+            except Exception:
+                log.exception("Failed to send progress email")
+
         # Invoke Claude
-        response = invoke_claude(prompt, session_id, resume=resume)
+        response = invoke_claude(prompt, session_id, resume=resume, on_progress=on_progress)
 
         # If resume failed, retry with full thread context on a fresh session
         if resume and "[Claude exited with code" in response:
@@ -573,7 +596,7 @@ def _poll_cycle(
                 )
             else:
                 prompt = att_preamble + body
-            response = invoke_claude(prompt, session_id, resume=False)
+            response = invoke_claude(prompt, session_id, resume=False, on_progress=on_progress)
 
         # Reply in thread
         try:
