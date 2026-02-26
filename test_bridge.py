@@ -327,5 +327,33 @@ class TestPreStartupSafety:
         assert new_msg_date_ms >= startup_ms
 
 
+
+
+# ---------------------------------------------------------------------------
+# strip_claude_prefix
+# ---------------------------------------------------------------------------
+
+
+class TestStripClaudePrefix:
+    """Tests for stripping the [claude] prefix from body and subject."""
+
+    def test_strip_lowercase_prefix(self):
+        assert bridge.strip_claude_prefix("[claude] what time is it?") == "what time is it?"
+
+    def test_strip_mixed_case_prefix(self):
+        assert bridge.strip_claude_prefix("[Claude] hello") == "hello"
+
+    def test_no_prefix_unchanged(self):
+        assert bridge.strip_claude_prefix("no prefix here") == "no prefix here"
+
+    def test_prefix_only_yields_empty(self):
+        assert bridge.strip_claude_prefix("[claude]") == ""
+
+    def test_prefix_with_extra_spaces(self):
+        assert bridge.strip_claude_prefix("[claude]   spaced out") == "spaced out"
+
+    def test_uppercase_prefix(self):
+        assert bridge.strip_claude_prefix("[CLAUDE] shout") == "shout"
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

@@ -15,6 +15,7 @@ import email.utils
 import json
 import logging
 import os
+import re
 import shutil
 import signal
 import subprocess
@@ -187,7 +188,6 @@ def strip_quoted_reply(text: str) -> str:
     Gmail format:  On Mon, Jan 1, 2026 at 10:00 Name <email> wrote:
     Outlook format: From: Name <email>
     """
-    import re
     # Gmail-style: "On ... wrote:" — may span lines and have blank lines before it
     match = re.search(r'\n\s*On .+?wrote:\s*$', text, re.DOTALL | re.MULTILINE)
     if match:
@@ -205,6 +205,11 @@ def strip_quoted_reply(text: str) -> str:
     while lines and lines[-1].lstrip().startswith(">"):
         lines.pop()
     return "\n".join(lines).strip()
+
+
+def strip_claude_prefix(text: str) -> str:
+    """Remove the [claude] subject prefix if present (case-insensitive)."""
+    return re.sub(r"^\[claude\]\s*", "", text, flags=re.IGNORECASE)
 
 
 def _extract_attachments(payload: dict) -> list[dict]:
@@ -593,6 +598,11 @@ def _poll_cycle(
 
         # Extract the user's question, stripping Gmail quoted reply text
         body = strip_quoted_reply(msg["body"].strip())
+        # Strip [claude] prefix from body and subject
+        body = strip_claude_prefix(body)
+        subject = strip_claude_prefix(msg["subject"])
+        if not body and subject:
+            body = subject
         if not body and not attachment_paths:
             log.info("Skipping message %s with empty body and no attachments", msg_id)
             mark_as_read(service, msg_id)
