@@ -7,6 +7,7 @@ import json
 import os
 import tempfile
 import time
+from datetime import datetime
 from pathlib import Path
 from unittest import mock
 
@@ -32,6 +33,7 @@ def tmp_config(tmp_path):
         PID_FILE=tmp_path / "bridge.pid",
         LOG_FILE=tmp_path / "bridge.log",
         ATTACHMENTS_DIR=tmp_path / "attachments",
+        DIGEST_LAST_SENT_FILE=tmp_path / "digest_last_sent.txt",
     ):
         yield tmp_path
 
@@ -240,7 +242,7 @@ class TestBuildThreadContext:
     def test_single_user_message(self):
         msgs = [{"from_name": "Zhengli Sun", "date": "Feb 26", "body": "hello"}]
         ctx = bridge.build_thread_context(msgs)
-        assert "[User — Feb 26]" in ctx
+        assert "[User -- Feb 26]" in ctx
         assert "hello" in ctx
 
     def test_bot_reply_labeled(self):
@@ -369,7 +371,6 @@ class TestListSessionsSlug:
         cwd = "/Users/zhengli.sun/Projects"
         expected_slug = "-Users-zhengli-sun-Projects"
 
-        # Create a fake sessions directory matching the corrected slug
         sessions_dir = tmp_path / expected_slug
         sessions_dir.mkdir()
         jsonl = sessions_dir / "session1.jsonl"
@@ -384,7 +385,7 @@ class TestListSessionsSlug:
     def test_slug_without_dot_fix_would_fail(self, tmp_path):
         """Verify the old slug (dots NOT replaced) would miss the directory."""
         cwd = "/Users/zhengli.sun/Projects"
-        wrong_slug = "-Users-zhengli.sun-Projects"  # dots kept
+        wrong_slug = "-Users-zhengli.sun-Projects"
 
         sessions_dir = tmp_path / wrong_slug
         sessions_dir.mkdir()
@@ -395,7 +396,6 @@ class TestListSessionsSlug:
              mock.patch.object(bridge, "CLAUDE_SESSIONS_DIR", tmp_path):
             result = bridge.list_sessions(count=5)
 
-        # The corrected code won't find the wrong-slug directory
         assert result == "No sessions found."
 
 
@@ -421,5 +421,101 @@ class TestHelpCommand:
     def test_help_command_recognized(self):
         body = bridge.strip_quoted_reply("/help")
         assert body.lower() == "/help"
+
+
+# ---------------------------------------------------------------------------
+# Daily digest
+# ---------------------------------------------------------------------------
+
+
+class TestDailyDigest:
+    """Tests for the daily digest email feature."""
+
+    def test_digest_skipped_if_already_sent_today(self, tmp_config):
+        """Digest must not send twice on the same day."""
+        today = datetime.now().strftime("%Y-%m-%d")
+        bridge.DIGEST_LAST_SENT_FILE.write_text(today)
+
+        mock_service = mock.MagicMock()
+        bridge.send_daily_digest(mock_service, "me@test.com", {}, 5)
+
+        mock_service.users().messages().send.assert_not_called()
+
+    def test_digest_skipped_if_wrong_hour(self, tmp_config):
+        """_maybe_send_digest should not fire outside DIGEST_HOUR."""
+        mock_service = mock.MagicMock()
+
+        with mock.patch("bridge.DIGEST_ENABLED", True), \
+             mock.patch("bridge.datetime") as mock_dt:
+            mock_dt.now.return_value = datetime(2026, 2, 26, 14, 0, 0)
+            mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)
+            with mock.patch("bridge.DIGEST_HOUR", 8):
+                bridge._maybe_send_digest(mock_service, "me@test.com", {}, 0)
+
+        mock_service.users().messages().send.assert_not_called()
+
+    def test_digest_body_contains_expected_sections(self, tmp_config):
+        """Digest email body should include key stats."""
+        mock_service = mock.MagicMock()
+        send_mock = mock_service.users.return_value.messages.return_value.send
+        send_mock.return_value.execute.return_value = {"id": "d1"}
+
+        with mock.patch.object(bridge, "_startup_time", datetime(2026, 2, 26, 7, 0)), \
+             mock.patch.object(bridge, "get_pending_reviews", return_value=[]):
+            bridge.send_daily_digest(mock_service, "me@test.com", {"t1": "s1", "t2": "s2"}, 42)
+
+        raw_b64 = send_mock.call_args[1]["body"]["raw"]
+        import base64 as b64
+        import email as email_mod
+        mime_bytes = b64.urlsafe_b64decode(raw_b64)
+        msg = email_mod.message_from_bytes(mime_bytes)
+        body = msg.get_payload(decode=True).decode()
+
+        assert "Messages processed today: 42" in body
+        assert "Active thread sessions: 2" in body
+        assert "/sessions" in body
+        assert "Daily Digest" in body
+
+    def test_digest_includes_pending_prs(self, tmp_config):
+        """Digest should include PRs needing review."""
+        mock_service = mock.MagicMock()
+        send_mock = mock_service.users.return_value.messages.return_value.send
+        send_mock.return_value.execute.return_value = {"id": "d1"}
+
+        fake_prs = [
+            {"number": 42, "title": "Fix login bug", "repo": "myorg/myrepo", "url": "https://github.com/myorg/myrepo/pull/42", "author": "alice"},
+            {"number": 7, "title": "Add tests", "repo": "myorg/other", "url": "https://github.com/myorg/other/pull/7", "author": "bob"},
+        ]
+
+        with mock.patch.object(bridge, "_startup_time", datetime(2026, 2, 26, 7, 0)), \
+             mock.patch.object(bridge, "get_pending_reviews", return_value=fake_prs):
+            bridge.send_daily_digest(mock_service, "me@test.com", {}, 0)
+
+        raw_b64 = send_mock.call_args[1]["body"]["raw"]
+        import base64 as b64
+        import email as email_mod
+        mime_bytes = b64.urlsafe_b64decode(raw_b64)
+        msg = email_mod.message_from_bytes(mime_bytes)
+        body = msg.get_payload(decode=True).decode()
+
+        assert "PRs Awaiting Your Review" in body
+        assert "#42" in body
+        assert "Fix login bug" in body
+        assert "alice" in body
+
+    def test_get_pending_reviews_handles_gh_not_found(self):
+        """get_pending_reviews should return [] if gh CLI is not installed."""
+        with mock.patch("subprocess.run", side_effect=FileNotFoundError):
+            result = bridge.get_pending_reviews()
+        assert result == []
+
+    def test_get_pending_reviews_handles_gh_error(self):
+        """get_pending_reviews should return [] if gh CLI fails."""
+        mock_result = mock.MagicMock()
+        mock_result.returncode = 1
+        mock_result.stdout = ""
+        with mock.patch("subprocess.run", return_value=mock_result):
+            result = bridge.get_pending_reviews()
+        assert result == []
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
