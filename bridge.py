@@ -181,6 +181,32 @@ def _extract_body(payload: dict) -> str:
     return ""
 
 
+def strip_quoted_reply(text: str) -> str:
+    """Strip Gmail/Outlook quoted reply text from an email body.
+
+    Gmail format:  On Mon, Jan 1, 2026 at 10:00 Name <email> wrote:
+    Outlook format: From: Name <email>
+    """
+    import re
+    # Gmail-style: "On ... wrote:" — may span lines and have blank lines before it
+    match = re.search(r'\n\s*On .+?wrote:\s*$', text, re.DOTALL | re.MULTILINE)
+    if match:
+        text = text[:match.start()]
+    # Outlook-style: "\nFrom: ..." block
+    match = re.search(r'\n\s*From: .+\n', text)
+    if match:
+        text = text[:match.start()]
+    # Forwarded message blocks
+    match = re.search(r'\n-+ ?Forwarded message', text)
+    if match:
+        text = text[:match.start()]
+    # Strip any remaining > quoted lines at the end
+    lines = text.rstrip().splitlines()
+    while lines and lines[-1].lstrip().startswith(">"):
+        lines.pop()
+    return "\n".join(lines).strip()
+
+
 def _extract_attachments(payload: dict) -> list[dict]:
     """Extract attachment metadata (filename, size, id) from a MIME payload."""
     attachments = []
@@ -565,8 +591,8 @@ def _poll_cycle(
         # Download attachments (if any)
         attachment_paths = download_attachments(service, msg_id, msg.get("attachments", []))
 
-        # Extract the user's question
-        body = msg["body"].strip()
+        # Extract the user's question, stripping Gmail quoted reply text
+        body = strip_quoted_reply(msg["body"].strip())
         if not body and not attachment_paths:
             log.info("Skipping message %s with empty body and no attachments", msg_id)
             mark_as_read(service, msg_id)
