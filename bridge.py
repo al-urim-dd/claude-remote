@@ -15,6 +15,7 @@ import email.utils
 import json
 import logging
 import os
+import shutil
 import signal
 import subprocess
 import sys
@@ -52,6 +53,9 @@ MAX_RESPONSE_LEN = 50_000  # chars
 CLAUDE_CWD = "/Users/zhengli.sun/Projects"
 SUBJECT_PREFIX = "[claude]"
 REPLY_SENDER_NAME = "ClaudeRemote"  # Display name on reply emails
+ATTACHMENTS_DIR = CONFIG_DIR / "attachments"
+MAX_ATTACHMENT_SIZE = 10 * 1024 * 1024  # 10 MB
+ATTACHMENT_MAX_AGE_HOURS = 24
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -135,8 +139,9 @@ def get_message(service, msg_id: str) -> dict:
 
     headers = {h["name"].lower(): h["value"] for h in msg["payload"]["headers"]}
 
-    # Extract plain text body
+    # Extract plain text body and attachments
     body = _extract_body(msg["payload"])
+    attachment_metas = _extract_attachments(msg["payload"])
 
     # Internal date is epoch ms
     internal_date = int(msg.get("internalDate", 0))
@@ -152,6 +157,7 @@ def get_message(service, msg_id: str) -> dict:
         "references": headers.get("references", ""),
         "internal_date_ms": internal_date,
         "body": body,
+        "attachments": attachment_metas,
         "label_ids": msg.get("labelIds", []),
     }
 
@@ -171,6 +177,70 @@ def _extract_body(payload: dict) -> str:
         return base64.urlsafe_b64decode(payload["body"]["data"]).decode("utf-8", errors="replace")
 
     return ""
+
+
+def _extract_attachments(payload: dict) -> list[dict]:
+    """Extract attachment metadata (filename, size, id) from a MIME payload."""
+    attachments = []
+    for part in payload.get("parts", []):
+        filename = part.get("filename")
+        if filename:
+            body = part.get("body", {})
+            attachments.append({
+                "filename": filename,
+                "mime_type": part.get("mimeType", "application/octet-stream"),
+                "size": body.get("size", 0),
+                "attachment_id": body.get("attachmentId"),
+                "data": body.get("data"),
+            })
+        attachments.extend(_extract_attachments(part))
+    return attachments
+
+
+def download_attachments(service, msg_id: str, attachment_metas: list[dict]) -> list[Path]:
+    """Download attachments to disk and return list of file paths."""
+    if not attachment_metas:
+        return []
+
+    msg_dir = ATTACHMENTS_DIR / msg_id
+    msg_dir.mkdir(parents=True, exist_ok=True)
+    paths = []
+
+    for att in attachment_metas:
+        if att["size"] > MAX_ATTACHMENT_SIZE:
+            log.warning("Skipping oversized attachment %s (%d bytes)", att["filename"], att["size"])
+            continue
+
+        if att["data"]:
+            data = base64.urlsafe_b64decode(att["data"])
+        elif att["attachment_id"]:
+            resp = (
+                service.users()
+                .messages()
+                .attachments()
+                .get(userId="me", messageId=msg_id, id=att["attachment_id"])
+                .execute()
+            )
+            data = base64.urlsafe_b64decode(resp["data"])
+        else:
+            continue
+
+        filepath = msg_dir / att["filename"]
+        filepath.write_bytes(data)
+        paths.append(filepath)
+        log.info("Saved attachment %s (%d bytes)", att["filename"], len(data))
+
+    return paths
+
+
+def cleanup_old_attachments():
+    """Remove attachment directories older than ATTACHMENT_MAX_AGE_HOURS."""
+    if not ATTACHMENTS_DIR.exists():
+        return
+    cutoff = time.time() - ATTACHMENT_MAX_AGE_HOURS * 3600
+    for child in ATTACHMENTS_DIR.iterdir():
+        if child.is_dir() and child.stat().st_mtime < cutoff:
+            shutil.rmtree(child, ignore_errors=True)
 
 
 def get_thread_history(service, thread_id: str) -> list[dict]:
@@ -400,6 +470,8 @@ def _poll_cycle(
     startup_time_ms: int,
 ):
     """Single poll iteration."""
+    cleanup_old_attachments()
+
     query = f"subject:{SUBJECT_PREFIX} is:unread"
     messages = search_messages(service, query)
 
@@ -440,10 +512,13 @@ def _poll_cycle(
             save_processed_id(msg_id)
             continue
 
+        # Download attachments (if any)
+        attachment_paths = download_attachments(service, msg_id, msg.get("attachments", []))
+
         # Extract the user's question
         body = msg["body"].strip()
-        if not body:
-            log.info("Skipping message %s with empty body", msg_id)
+        if not body and not attachment_paths:
+            log.info("Skipping message %s with empty body and no attachments", msg_id)
             mark_as_read(service, msg_id)
             processed_ids.add(msg_id)
             save_processed_id(msg_id)
@@ -459,20 +534,27 @@ def _poll_cycle(
         else:
             session_id = str(uuid.uuid4())
 
+        # Build attachment preamble
+        att_preamble = ""
+        if attachment_paths:
+            file_list = "\n".join(f"  - {p.name}: {p}" for p in attachment_paths)
+            att_preamble = f"Attached files (read and analyze these):\n{file_list}\n\n"
+
         # Build the prompt: for resumed sessions just send the latest message,
         # for fresh sessions include the full thread for context
         if resume:
-            prompt = body
+            prompt = att_preamble + body
         else:
             thread_messages = get_thread_history(service, thread_id)
             if len(thread_messages) > 1:
                 prompt = (
-                    "Here is the email conversation so far:\n\n"
+                    att_preamble
+                    + "Here is the email conversation so far:\n\n"
                     + build_thread_context(thread_messages)
                     + "\n\n---\n\nPlease respond to the latest message above."
                 )
             else:
-                prompt = body
+                prompt = att_preamble + body
 
         # Invoke Claude
         response = invoke_claude(prompt, session_id, resume=resume)
@@ -484,12 +566,13 @@ def _poll_cycle(
             thread_messages = get_thread_history(service, thread_id)
             if len(thread_messages) > 1:
                 prompt = (
-                    "Here is the email conversation so far:\n\n"
+                    att_preamble
+                    + "Here is the email conversation so far:\n\n"
                     + build_thread_context(thread_messages)
                     + "\n\n---\n\nPlease respond to the latest message above."
                 )
             else:
-                prompt = body
+                prompt = att_preamble + body
             response = invoke_claude(prompt, session_id, resume=False)
 
         # Reply in thread
