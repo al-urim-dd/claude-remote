@@ -71,11 +71,24 @@ The bridge picks it up within ~30 seconds and replies in the same thread. Reply 
 ## Features
 
 - **Multi-turn conversations** — replies in the same thread share a Claude session
+- **Thread history context** — when a session can't be resumed (e.g. after restart), the bridge fetches the full email thread and sends prior messages as context
+- **File attachments** — send images, PDFs, or code files as email attachments and Claude will read and analyze them
+- **Progress emails** — for long-running tasks, sends "still working..." replies every 2 minutes so you know the request wasn't lost
+- **Session management** — email `/sessions` to list recent Claude sessions, `/resume <id>` to resume any session (including ones started from the terminal)
+- **Read-tolerant** — uses time-based search instead of unread status, so accidentally opening an email won't cause it to be missed
+- **Quoted reply stripping** — strips Gmail/Outlook quoted reply text so Claude only sees your new message
 - **Distinct sender** — bridge replies show as "ClaudeRemote" so you can tell them apart from your own emails
-- **Startup safety** — ignores all pre-existing unread emails on startup (no stale replay)
+- **Startup safety** — ignores all pre-existing emails on startup (no stale replay)
 - **Self-only** — only processes emails sent from your own address
 - **Auto-recovery** — re-authenticates on token expiry, retries fresh session on resume failure
 - **Graceful shutdown** — handles SIGINT/SIGTERM cleanly
+
+## Commands
+
+| Command | Description |
+|---------|-------------|
+| `/sessions` | List your 10 most recent Claude Code sessions (ID, timestamp, first message) |
+| `/resume <session-id>` | Resume any session by ID — including ones started from the terminal |
 
 ## Project Structure
 
@@ -87,12 +100,13 @@ claude-remote/
 └── README.md
 
 ~/.claude-remote/
-├── client_secret.json  # OAuth credentials (you provide this)
-├── token.json          # Cached OAuth token (auto-generated)
-├── processed.txt       # Processed message IDs
+├── client_secret.json   # OAuth credentials (you provide this)
+├── token.json           # Cached OAuth token (auto-generated)
+├── processed.txt        # Processed message IDs
 ├── thread_sessions.json # Thread → Claude session mapping
-├── bridge.pid          # PID file (when running as daemon)
-└── bridge.log          # Log file
+├── attachments/         # Downloaded email attachments (auto-cleaned after 24h)
+├── bridge.pid           # PID file (when running as daemon)
+└── bridge.log           # Log file
 ```
 
 ## Configuration
@@ -102,11 +116,13 @@ Edit the constants at the top of `bridge.py`:
 | Constant | Default | Description |
 |----------|---------|-------------|
 | `POLL_INTERVAL` | `30` | Seconds between Gmail polls |
-| `CLAUDE_TIMEOUT` | `300` | Max seconds per Claude invocation |
+| `CLAUDE_TIMEOUT` | `600` | Max seconds per Claude invocation |
 | `MAX_RESPONSE_LEN` | `50000` | Truncate replies beyond this length |
 | `CLAUDE_CWD` | `~/Projects` | Working directory for Claude |
 | `SUBJECT_PREFIX` | `[claude]` | Email subject prefix to watch for |
 | `REPLY_SENDER_NAME` | `ClaudeRemote` | Display name on reply emails |
+| `MAX_ATTACHMENT_SIZE` | `10MB` | Skip attachments larger than this |
+| `PROGRESS_INTERVAL` | `120` | Seconds between "still working" progress emails |
 
 ## Security
 
