@@ -23,6 +23,7 @@ import sys
 import time
 import uuid
 from datetime import datetime, timezone
+from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from pathlib import Path
 
@@ -78,6 +79,9 @@ DIGEST_HOUR = 8  # Send digest at 8am local time
 DIGEST_LAST_SENT_FILE = CONFIG_DIR / "digest_last_sent.txt"
 
 CANCEL_FILE = CONFIG_DIR / "cancel.txt"
+
+RATE_LIMIT_PER_HOUR = 20  # Max Claude invocations per hour
+RATE_LIMIT_FILE = CONFIG_DIR / "rate_limit.json"  # Tracks invocation timestamps
 
 # Module-level state (set in run_bridge)
 _startup_time: datetime | None = None
@@ -340,6 +344,35 @@ def build_thread_context(thread_messages: list[dict]) -> str:
     return "\n\n---\n\n".join(parts)
 
 
+def format_html_reply(text: str) -> str:
+    """Convert Claude's markdown output to email-safe HTML."""
+    import markdown
+    html_body = markdown.markdown(
+        text,
+        extensions=["fenced_code", "tables", "nl2br"],
+    )
+    style = (
+        "<style>"
+        "pre { background: #f6f8fa; padding: 12px; border-radius: 6px; overflow-x: auto; font-size: 13px; } "
+        "code { background: #f0f0f0; padding: 2px 6px; border-radius: 3px; font-size: 13px; font-family: 'SF Mono', Monaco, Consolas, monospace; } "
+        "pre code { background: none; padding: 0; } "
+        "table { border-collapse: collapse; margin: 8px 0; } "
+        "th, td { border: 1px solid #ddd; padding: 6px 12px; text-align: left; } "
+        "th { background: #f6f8fa; } "
+        "blockquote { border-left: 3px solid #ddd; margin: 8px 0; padding: 4px 12px; color: #555; }"
+        "</style>"
+    )
+    return (
+        "<html><body>\n"
+        "<div style=\"font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; "
+        "font-size: 14px; line-height: 1.6; color: #1a1a1a;\">\n"
+        + html_body + "\n"
+        "</div>\n"
+        + style + "\n"
+        "</body></html>"
+    )
+
+
 def send_reply(service, original_msg: dict, body_text: str, my_email: str, override_subject: str = None):
     """Reply to a message in the same thread with a distinct sender name."""
     if override_subject:
@@ -357,14 +390,23 @@ def send_reply(service, original_msg: dict, body_text: str, my_email: str, overr
         else:
             references = original_msg["message_id"]
 
-    message = MIMEText(body_text)
-    message["from"] = f"{REPLY_SENDER_NAME} <{my_email}>"
-    message["to"] = original_msg["from"]
-    message["subject"] = subject
-    message["In-Reply-To"] = original_msg.get("message_id", "")
-    message["References"] = references
+    # Use HTML if the body contains markdown-like content
+    has_markdown = any(marker in body_text for marker in ['```', '# ', '**', '- ', '| '])
 
-    raw = base64.urlsafe_b64encode(message.as_bytes()).decode("ascii")
+    if has_markdown:
+        msg_mime = MIMEMultipart("alternative")
+        msg_mime.attach(MIMEText(body_text, "plain"))
+        msg_mime.attach(MIMEText(format_html_reply(body_text), "html"))
+    else:
+        msg_mime = MIMEText(body_text)
+
+    msg_mime["from"] = f"{REPLY_SENDER_NAME} <{my_email}>"
+    msg_mime["to"] = original_msg["from"]
+    msg_mime["subject"] = subject
+    msg_mime["In-Reply-To"] = original_msg.get("message_id", "")
+    msg_mime["References"] = references
+
+    raw = base64.urlsafe_b64encode(msg_mime.as_bytes()).decode("ascii")
 
     sent = (
         service.users()

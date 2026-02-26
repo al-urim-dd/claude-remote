@@ -597,5 +597,64 @@ class TestInvokeClaudeErrors:
         assert "empty output" in result.lower()
         assert "rephrasing" in result.lower()
 
+
+
+# ---------------------------------------------------------------------------
+# format_html_reply
+# ---------------------------------------------------------------------------
+
+
+class TestFormatHtmlReply:
+    """Tests for markdown-to-HTML email conversion."""
+
+    def test_format_html_reply_code_block(self):
+        """Verify fenced code blocks get wrapped in <pre><code>."""
+        text = "Here is code:\n\n```python\nprint('hello')\n```"
+        result = bridge.format_html_reply(text)
+        assert "<pre>" in result
+        assert "<code" in result
+        assert "print" in result
+
+    def test_format_html_reply_heading(self):
+        """Verify # Title becomes <h1>."""
+        text = "# My Title\n\nSome text"
+        result = bridge.format_html_reply(text)
+        assert "<h1>" in result
+        assert "My Title" in result
+
+    def test_format_html_reply_has_styles(self):
+        """Verify CSS styles are included in the output."""
+        text = "hello world"
+        result = bridge.format_html_reply(text)
+        assert "<style>" in result
+        assert "font-family" in result
+        assert "border-radius" in result
+
+    def test_plain_text_no_markdown(self):
+        """Simple text without markdown markers stays as plain MIMEText."""
+        original_msg = {
+            "subject": "[claude] test",
+            "from": "User <user@example.com>",
+            "message_id": "<abc@gmail.com>",
+            "references": "",
+            "thread_id": "thread123",
+        }
+        my_email = "bot@example.com"
+
+        mock_service = mock.MagicMock()
+        mock_service.users().messages().send().execute.return_value = {"id": "sent1"}
+
+        # Plain text with no markdown markers
+        bridge.send_reply(mock_service, original_msg, "just plain text", my_email)
+
+        call_args = mock_service.users().messages().send.call_args
+        body = call_args[1]["body"] if "body" in call_args[1] else call_args[0][0]
+        raw = body.get("raw", "")
+        decoded = base64.urlsafe_b64decode(raw).decode()
+
+        # Should be plain text MIME, not multipart
+        assert "text/plain" in decoded
+        assert "multipart/alternative" not in decoded
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
