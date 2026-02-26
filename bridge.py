@@ -592,6 +592,47 @@ def save_thread_sessions(sessions: dict[str, str]):
 
 
 # ---------------------------------------------------------------------------
+# Rate Limiting
+# ---------------------------------------------------------------------------
+
+
+def _check_rate_limit() -> tuple[bool, int]:
+    """Check if we're within the rate limit. Returns (allowed, remaining)."""
+    now = time.time()
+    cutoff = now - 3600  # 1 hour window
+
+    timestamps = []
+    if RATE_LIMIT_FILE.exists():
+        try:
+            timestamps = json.loads(RATE_LIMIT_FILE.read_text())
+        except (json.JSONDecodeError, ValueError):
+            timestamps = []
+
+    # Prune old entries
+    timestamps = [t for t in timestamps if t > cutoff]
+
+    remaining = RATE_LIMIT_PER_HOUR - len(timestamps)
+    return remaining > 0, max(remaining, 0)
+
+
+def _record_invocation():
+    """Record a Claude invocation timestamp for rate limiting."""
+    now = time.time()
+    cutoff = now - 3600
+
+    timestamps = []
+    if RATE_LIMIT_FILE.exists():
+        try:
+            timestamps = json.loads(RATE_LIMIT_FILE.read_text())
+        except (json.JSONDecodeError, ValueError):
+            timestamps = []
+
+    timestamps = [t for t in timestamps if t > cutoff]
+    timestamps.append(now)
+    RATE_LIMIT_FILE.write_text(json.dumps(timestamps))
+
+
+# ---------------------------------------------------------------------------
 # Daily Digest
 # ---------------------------------------------------------------------------
 
@@ -919,8 +960,25 @@ def _poll_cycle(
             except Exception:
                 log.exception("Failed to send progress email")
 
+        # Rate limit check
+        allowed, remaining = _check_rate_limit()
+        if not allowed:
+            response = (
+                "[Rate limit reached]\n\n"
+                f"You've used {RATE_LIMIT_PER_HOUR} Claude invocations in the last hour.\n"
+                "Wait a bit and try again, or adjust RATE_LIMIT_PER_HOUR in bridge.py."
+            )
+            send_reply(service, msg, response, my_email)
+            mark_as_read(service, msg_id)
+            processed_ids.add(msg_id)
+            save_processed_id(msg_id)
+            continue
+
+        log.info("Rate limit: %d/%d remaining", remaining, RATE_LIMIT_PER_HOUR)
+
         # Invoke Claude
         response = invoke_claude(prompt, session_id, resume=resume, on_progress=on_progress, thread_id=thread_id)
+        _record_invocation()
 
         # If resume failed, retry with full thread context on a fresh session
         if resume and "[Claude exited with code" in response:
@@ -937,6 +995,7 @@ def _poll_cycle(
             else:
                 prompt = att_preamble + body
             response = invoke_claude(prompt, session_id, resume=False, on_progress=on_progress, thread_id=thread_id)
+            _record_invocation()
 
         # Reply in thread -- override subject on first reply in new thread
         try:

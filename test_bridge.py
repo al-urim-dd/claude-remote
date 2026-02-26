@@ -34,6 +34,7 @@ def tmp_config(tmp_path):
         LOG_FILE=tmp_path / "bridge.log",
         ATTACHMENTS_DIR=tmp_path / "attachments",
         DIGEST_LAST_SENT_FILE=tmp_path / "digest_last_sent.txt",
+        RATE_LIMIT_FILE=tmp_path / "rate_limit.json",
     ):
         yield tmp_path
 
@@ -655,6 +656,60 @@ class TestFormatHtmlReply:
         # Should be plain text MIME, not multipart
         assert "text/plain" in decoded
         assert "multipart/alternative" not in decoded
+
+# ---------------------------------------------------------------------------
+# Rate limiting
+# ---------------------------------------------------------------------------
+
+
+class TestRateLimiting:
+    """Tests for the per-hour rate limiting feature."""
+
+    def test_rate_limit_allows_when_under(self, tmp_config):
+        """Fresh state (no file) should allow invocations."""
+        allowed, remaining = bridge._check_rate_limit()
+        assert allowed is True
+        assert remaining == bridge.RATE_LIMIT_PER_HOUR
+
+    def test_rate_limit_blocks_when_exceeded(self, tmp_config):
+        """When RATE_LIMIT_PER_HOUR timestamps exist within the hour, should block."""
+        now = time.time()
+        timestamps = [now - i for i in range(bridge.RATE_LIMIT_PER_HOUR)]
+        bridge.RATE_LIMIT_FILE.write_text(json.dumps(timestamps))
+
+        allowed, remaining = bridge._check_rate_limit()
+        assert allowed is False
+        assert remaining == 0
+
+    def test_rate_limit_prunes_old_entries(self, tmp_config):
+        """Timestamps older than 1 hour should be pruned and not count."""
+        now = time.time()
+        old_timestamps = [now - 7200 + i for i in range(10)]  # 2 hours ago
+        recent_timestamps = [now - 60 + i for i in range(3)]  # 1 minute ago
+        all_timestamps = old_timestamps + recent_timestamps
+        bridge.RATE_LIMIT_FILE.write_text(json.dumps(all_timestamps))
+
+        allowed, remaining = bridge._check_rate_limit()
+        assert allowed is True
+        assert remaining == bridge.RATE_LIMIT_PER_HOUR - len(recent_timestamps)
+
+    def test_record_invocation_appends(self, tmp_config):
+        """Recording an invocation should add a timestamp to the file."""
+        assert not bridge.RATE_LIMIT_FILE.exists()
+
+        bridge._record_invocation()
+
+        assert bridge.RATE_LIMIT_FILE.exists()
+        timestamps = json.loads(bridge.RATE_LIMIT_FILE.read_text())
+        assert len(timestamps) == 1
+        assert timestamps[0] <= time.time()
+        assert timestamps[0] > time.time() - 5  # within last 5 seconds
+
+        # Record another
+        bridge._record_invocation()
+        timestamps = json.loads(bridge.RATE_LIMIT_FILE.read_text())
+        assert len(timestamps) == 2
+
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
