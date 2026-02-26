@@ -57,6 +57,7 @@ ATTACHMENTS_DIR = CONFIG_DIR / "attachments"
 MAX_ATTACHMENT_SIZE = 10 * 1024 * 1024  # 10 MB
 ATTACHMENT_MAX_AGE_HOURS = 24
 PROGRESS_INTERVAL = 120  # seconds between "still working" emails
+CLAUDE_SESSIONS_DIR = Path.home() / ".claude" / "projects"
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -382,6 +383,41 @@ def invoke_claude(
     return output
 
 
+def list_sessions(count: int = 10) -> str:
+    """List recent Claude Code sessions by reading JSONL files from disk."""
+    cwd_slug = CLAUDE_CWD.replace("/", "-")
+    sessions_dir = CLAUDE_SESSIONS_DIR / cwd_slug
+    if not sessions_dir.exists():
+        return "No sessions found."
+
+    entries = []
+    for f in sorted(sessions_dir.glob("*.jsonl"), key=lambda p: p.stat().st_mtime, reverse=True)[:count]:
+        first_msg = ""
+        for line in f.read_text().splitlines():
+            try:
+                d = json.loads(line)
+            except (json.JSONDecodeError, ValueError):
+                continue
+            if d.get("type") == "summary":
+                first_msg = d.get("summary", "")[:80]
+                break
+            msg = d.get("message")
+            if isinstance(msg, dict) and msg.get("role") == "user" and not first_msg:
+                content = msg.get("content", "")
+                if isinstance(content, str):
+                    first_msg = content.strip().replace("\n", " ")[:80]
+                elif isinstance(content, list) and content:
+                    c = content[0]
+                    first_msg = (c.get("text", "") if isinstance(c, dict) else str(c))[:80]
+        mtime = datetime.fromtimestamp(f.stat().st_mtime)
+        entries.append(f"{f.stem}\n  {mtime:%Y-%m-%d %H:%M}  {first_msg}")
+
+    if not entries:
+        return "No sessions found."
+    header = "Recent Claude sessions (reply /resume <id> to continue one):\n"
+    return header + "\n\n".join(entries)
+
+
 # ---------------------------------------------------------------------------
 # State Management
 # ---------------------------------------------------------------------------
@@ -540,6 +576,30 @@ def _poll_cycle(
 
         thread_id = msg["thread_id"]
         log.info("Processing message %s in thread %s: %.80s", msg_id, thread_id, body)
+
+        # Built-in commands: /sessions and /resume <id>
+        if body.lower().strip() == "/sessions":
+            response = list_sessions()
+            send_reply(service, msg, response, my_email)
+            mark_as_read(service, msg_id)
+            processed_ids.add(msg_id)
+            save_processed_id(msg_id)
+            continue
+        if body.lower().strip().startswith("/resume "):
+            resume_id = body.strip().split(None, 1)[1].strip()
+            session_id = resume_id
+            thread_sessions[thread_id] = session_id
+            save_thread_sessions(thread_sessions)
+            response = invoke_claude(
+                "The user just resumed this session from their phone via email. "
+                "Briefly summarize what you were working on, and ask how to proceed.",
+                session_id, resume=True,
+            )
+            send_reply(service, msg, response, my_email)
+            mark_as_read(service, msg_id)
+            processed_ids.add(msg_id)
+            save_processed_id(msg_id)
+            continue
 
         # Determine session: resume existing or start new
         resume = thread_id in thread_sessions
