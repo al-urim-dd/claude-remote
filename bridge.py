@@ -387,10 +387,16 @@ def _poll_cycle(
             save_processed_id(msg_id)
             continue
 
-        # Sender check: only process emails from ourselves
-        sender_email = email.utils.parseaddr(msg["from"])[1].lower()
-        if sender_email != my_email.lower():
+        # Sender check: only process emails from ourselves, skip our own replies
+        sender_name, sender_email = email.utils.parseaddr(msg["from"])
+        if sender_email.lower() != my_email.lower():
             log.info("Skipping message from %s (not self)", sender_email)
+            mark_as_read(service, msg_id)
+            processed_ids.add(msg_id)
+            save_processed_id(msg_id)
+            continue
+        if sender_name == REPLY_SENDER_NAME:
+            log.info("Skipping own reply %s (from %s)", msg_id, REPLY_SENDER_NAME)
             mark_as_read(service, msg_id)
             processed_ids.add(msg_id)
             save_processed_id(msg_id)
