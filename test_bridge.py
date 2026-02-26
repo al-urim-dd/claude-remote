@@ -355,5 +355,48 @@ class TestStripClaudePrefix:
     def test_uppercase_prefix(self):
         assert bridge.strip_claude_prefix("[CLAUDE] shout") == "shout"
 
+
+# ---------------------------------------------------------------------------
+# list_sessions slug calculation
+# ---------------------------------------------------------------------------
+
+
+class TestListSessionsSlug:
+    """Slug must replace both '/' and '.' with '-'."""
+
+    def test_slug_replaces_dots_and_slashes(self, tmp_path):
+        """Paths like /Users/zhengli.sun/Projects produce correct slug."""
+        cwd = "/Users/zhengli.sun/Projects"
+        expected_slug = "-Users-zhengli-sun-Projects"
+
+        # Create a fake sessions directory matching the corrected slug
+        sessions_dir = tmp_path / expected_slug
+        sessions_dir.mkdir()
+        jsonl = sessions_dir / "session1.jsonl"
+        jsonl.write_text(json.dumps({"type": "summary", "summary": "test session"}) + "\n")
+
+        with mock.patch.object(bridge, "CLAUDE_CWD", cwd), \
+             mock.patch.object(bridge, "CLAUDE_SESSIONS_DIR", tmp_path):
+            result = bridge.list_sessions(count=5)
+
+        assert "session1" in result or "test session" in result
+
+    def test_slug_without_dot_fix_would_fail(self, tmp_path):
+        """Verify the old slug (dots NOT replaced) would miss the directory."""
+        cwd = "/Users/zhengli.sun/Projects"
+        wrong_slug = "-Users-zhengli.sun-Projects"  # dots kept
+
+        sessions_dir = tmp_path / wrong_slug
+        sessions_dir.mkdir()
+        jsonl = sessions_dir / "session1.jsonl"
+        jsonl.write_text(json.dumps({"type": "summary", "summary": "test"}) + "\n")
+
+        with mock.patch.object(bridge, "CLAUDE_CWD", cwd), \
+             mock.patch.object(bridge, "CLAUDE_SESSIONS_DIR", tmp_path):
+            result = bridge.list_sessions(count=5)
+
+        # The corrected code won't find the wrong-slug directory
+        assert result == "No sessions found."
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
