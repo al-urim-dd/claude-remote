@@ -77,8 +77,11 @@ DIGEST_ENABLED = True
 DIGEST_HOUR = 8  # Send digest at 8am local time
 DIGEST_LAST_SENT_FILE = CONFIG_DIR / "digest_last_sent.txt"
 
-# Module-level startup time (set in run_bridge)
+CANCEL_FILE = CONFIG_DIR / "cancel.txt"
+
+# Module-level state (set in run_bridge)
 _startup_time: datetime | None = None
+_messages_processed: int = 0
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -387,11 +390,24 @@ def mark_as_read(service, msg_id: str):
 # ---------------------------------------------------------------------------
 
 
+def _check_cancel(thread_id: str) -> bool:
+    """Check if thread_id is in the cancel file; remove it if found."""
+    if not CANCEL_FILE.exists():
+        return False
+    lines = CANCEL_FILE.read_text().strip().splitlines()
+    if thread_id in lines:
+        remaining = [t for t in lines if t != thread_id]
+        CANCEL_FILE.write_text("\n".join(remaining) + "\n" if remaining else "")
+        return True
+    return False
+
+
 def invoke_claude(
     message: str,
     session_id: str,
     resume: bool = False,
     on_progress: callable = None,
+    thread_id: str = None,
 ) -> str:
     """Run claude -p as a subprocess, sending progress callbacks while waiting."""
     env = os.environ.copy()
@@ -416,6 +432,11 @@ def invoke_claude(
         while proc.poll() is None:
             time.sleep(1)
             elapsed += 1
+            if thread_id and _check_cancel(thread_id):
+                proc.kill()
+                proc.wait()
+                log.info("Cancelled Claude for thread %s", thread_id)
+                return "[Cancelled by user]\n\nThe task was cancelled. Send a new message to start fresh."
             if elapsed >= CLAUDE_TIMEOUT:
                 proc.kill()
                 proc.wait()
@@ -627,8 +648,9 @@ def _maybe_send_digest(service, my_email, thread_sessions, processed_count):
 
 def run_bridge(foreground: bool = False):
     """Main loop: poll Gmail, process messages, reply."""
-    global _startup_time
+    global _startup_time, _messages_processed
     setup_logging(foreground=foreground)
+    _messages_processed = 0
     log.info("Starting ClaudeRemote")
 
     # Authenticate
@@ -753,9 +775,42 @@ def _poll_cycle(
         thread_id = msg["thread_id"]
         log.info("Processing message %s in thread %s: %.80s", msg_id, thread_id, body)
 
-        # Built-in commands: /help, /sessions, and /resume <id>
+        # Built-in commands: /help, /status, /cancel, /sessions, /resume <id>
         if body.lower() == "/help":
             response = HELP_TEXT
+            send_reply(service, msg, response, my_email)
+            mark_as_read(service, msg_id)
+            processed_ids.add(msg_id)
+            save_processed_id(msg_id)
+            continue
+        if body.lower() == "/status":
+            global _messages_processed
+            uptime = datetime.now(timezone.utc) - _startup_time if _startup_time else None
+            if uptime:
+                hours, remainder = divmod(int(uptime.total_seconds()), 3600)
+                minutes, seconds = divmod(remainder, 60)
+                uptime_str = f"{hours}h {minutes}m {seconds}s"
+            else:
+                uptime_str = "unknown"
+            current_session = thread_sessions.get(thread_id, "none")
+            response = (
+                f"ClaudeRemote Status\n"
+                f"---\n"
+                f"Uptime: {uptime_str}\n"
+                f"Messages processed: {_messages_processed}\n"
+                f"Active threads: {len(thread_sessions)}\n"
+                f"This thread's session: {current_session}\n"
+                f"PID: {os.getpid()}"
+            )
+            send_reply(service, msg, response, my_email)
+            mark_as_read(service, msg_id)
+            processed_ids.add(msg_id)
+            save_processed_id(msg_id)
+            continue
+        if body.lower() == "/cancel":
+            with open(CANCEL_FILE, "a") as f:
+                f.write(thread_id + "\n")
+            response = "Cancel requested. If a task is running in this thread, it will be stopped."
             send_reply(service, msg, response, my_email)
             mark_as_read(service, msg_id)
             processed_ids.add(msg_id)
@@ -823,7 +878,7 @@ def _poll_cycle(
                 log.exception("Failed to send progress email")
 
         # Invoke Claude
-        response = invoke_claude(prompt, session_id, resume=resume, on_progress=on_progress)
+        response = invoke_claude(prompt, session_id, resume=resume, on_progress=on_progress, thread_id=thread_id)
 
         # If resume failed, retry with full thread context on a fresh session
         if resume and "[Claude exited with code" in response:
@@ -839,7 +894,7 @@ def _poll_cycle(
                 )
             else:
                 prompt = att_preamble + body
-            response = invoke_claude(prompt, session_id, resume=False, on_progress=on_progress)
+            response = invoke_claude(prompt, session_id, resume=False, on_progress=on_progress, thread_id=thread_id)
 
         # Reply in thread -- override subject on first reply in new thread
         try:
@@ -858,6 +913,7 @@ def _poll_cycle(
         save_processed_id(msg_id)
         thread_sessions[thread_id] = session_id
         save_thread_sessions(thread_sessions)
+        _messages_processed += 1
 
 
 # ---------------------------------------------------------------------------
