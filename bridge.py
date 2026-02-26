@@ -47,7 +47,7 @@ SCOPES = [
 ]
 
 POLL_INTERVAL = 30  # seconds
-CLAUDE_TIMEOUT = 300  # 5 minutes
+CLAUDE_TIMEOUT = 600  # 10 minutes
 MAX_RESPONSE_LEN = 50_000  # chars
 CLAUDE_CWD = "/Users/zhengli.sun/Projects"
 SUBJECT_PREFIX = "[claude]"
@@ -173,6 +173,42 @@ def _extract_body(payload: dict) -> str:
     return ""
 
 
+def get_thread_history(service, thread_id: str) -> list[dict]:
+    """Fetch all messages in a thread, sorted chronologically."""
+    thread = (
+        service.users()
+        .threads()
+        .get(userId="me", id=thread_id, format="full")
+        .execute()
+    )
+    messages = []
+    for msg in thread.get("messages", []):
+        headers = {h["name"].lower(): h["value"] for h in msg["payload"]["headers"]}
+        sender_name, _ = email.utils.parseaddr(headers.get("from", ""))
+        body = _extract_body(msg["payload"])
+        messages.append({
+            "from_name": sender_name,
+            "date": headers.get("date", ""),
+            "body": body.strip(),
+        })
+    return messages
+
+
+def build_thread_context(thread_messages: list[dict]) -> str:
+    """Format thread history as a conversation for Claude."""
+    parts = []
+    for msg in thread_messages:
+        sender = msg["from_name"] or "Unknown"
+        if sender == REPLY_SENDER_NAME:
+            role = "You (Claude, in a previous reply)"
+        else:
+            role = "User"
+        body = msg["body"]
+        if body:
+            parts.append(f"[{role} — {msg['date']}]\n{body}")
+    return "\n\n---\n\n".join(parts)
+
+
 def send_reply(service, original_msg: dict, body_text: str, my_email: str):
     """Reply to a message in the same thread with a distinct sender name."""
     subject = original_msg["subject"]
@@ -228,6 +264,8 @@ def invoke_claude(message: str, session_id: str, resume: bool = False) -> str:
     cmd = ["claude", "-p", "--output-format", "text"]
     if resume:
         cmd.extend(["--resume", session_id])
+    else:
+        cmd.extend(["--session-id", session_id])
     cmd.append(message)
 
     log.info("Invoking Claude (resume=%s, session=%s)", resume, session_id[:8])
@@ -421,14 +459,38 @@ def _poll_cycle(
         else:
             session_id = str(uuid.uuid4())
 
-        # Invoke Claude
-        response = invoke_claude(body, session_id, resume=resume)
+        # Build the prompt: for resumed sessions just send the latest message,
+        # for fresh sessions include the full thread for context
+        if resume:
+            prompt = body
+        else:
+            thread_messages = get_thread_history(service, thread_id)
+            if len(thread_messages) > 1:
+                prompt = (
+                    "Here is the email conversation so far:\n\n"
+                    + build_thread_context(thread_messages)
+                    + "\n\n---\n\nPlease respond to the latest message above."
+                )
+            else:
+                prompt = body
 
-        # If resume failed, retry without resume
+        # Invoke Claude
+        response = invoke_claude(prompt, session_id, resume=resume)
+
+        # If resume failed, retry with full thread context on a fresh session
         if resume and "[Claude exited with code" in response:
-            log.warning("Resume failed for session %s, retrying fresh", session_id[:8])
+            log.warning("Resume failed for session %s, retrying fresh with thread context", session_id[:8])
             session_id = str(uuid.uuid4())
-            response = invoke_claude(body, session_id, resume=False)
+            thread_messages = get_thread_history(service, thread_id)
+            if len(thread_messages) > 1:
+                prompt = (
+                    "Here is the email conversation so far:\n\n"
+                    + build_thread_context(thread_messages)
+                    + "\n\n---\n\nPlease respond to the latest message above."
+                )
+            else:
+                prompt = body
+            response = invoke_claude(prompt, session_id, resume=False)
 
         # Reply in thread
         try:
