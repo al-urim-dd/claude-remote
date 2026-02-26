@@ -32,6 +32,7 @@ def tmp_config(tmp_path):
         PID_FILE=tmp_path / "bridge.pid",
         LOG_FILE=tmp_path / "bridge.log",
         ATTACHMENTS_DIR=tmp_path / "attachments",
+        CANCEL_FILE=tmp_path / "cancel.txt",
     ):
         yield tmp_path
 
@@ -325,6 +326,46 @@ class TestPreStartupSafety:
         startup_ms = int(time.time() * 1000)
         new_msg_date_ms = startup_ms + 5_000  # 5 seconds after startup
         assert new_msg_date_ms >= startup_ms
+
+
+
+# ---------------------------------------------------------------------------
+# /cancel command and _check_cancel
+# ---------------------------------------------------------------------------
+
+
+class TestCancelCommand:
+    """Tests for /cancel command and cancel-file mechanism."""
+
+    def test_check_cancel_no_file(self, tmp_config):
+        """Returns False when cancel file does not exist."""
+        assert bridge._check_cancel("thread1") is False
+
+    def test_check_cancel_thread_present(self, tmp_config):
+        """Returns True and removes thread from cancel file."""
+        bridge.CANCEL_FILE.write_text("thread1\nthread2\n")
+        assert bridge._check_cancel("thread1") is True
+        remaining = bridge.CANCEL_FILE.read_text().strip().splitlines()
+        assert "thread1" not in remaining
+        assert "thread2" in remaining
+
+    def test_check_cancel_thread_absent(self, tmp_config):
+        """Returns False when thread is not in cancel file."""
+        bridge.CANCEL_FILE.write_text("thread2\n")
+        assert bridge._check_cancel("thread1") is False
+
+    def test_check_cancel_last_thread_clears_file(self, tmp_config):
+        """Cancel file is cleared when the last thread is removed."""
+        bridge.CANCEL_FILE.write_text("thread1\n")
+        assert bridge._check_cancel("thread1") is True
+        assert bridge.CANCEL_FILE.read_text() == ""
+
+    def test_cancel_command_writes_file(self, tmp_config):
+        """Sending /cancel writes thread_id to cancel file."""
+        thread_id = "t_cancel_test"
+        with open(bridge.CANCEL_FILE, "a") as f:
+            f.write(thread_id + "\n")
+        assert thread_id in bridge.CANCEL_FILE.read_text()
 
 
 if __name__ == "__main__":
