@@ -416,7 +416,7 @@ def invoke_claude(
 
 def list_sessions(count: int = 10) -> str:
     """List recent Claude Code sessions by reading JSONL files from disk."""
-    cwd_slug = CLAUDE_CWD.replace("/", "-")
+    cwd_slug = CLAUDE_CWD.replace("/", "-").replace(".", "-")
     sessions_dir = CLAUDE_SESSIONS_DIR / cwd_slug
     if not sessions_dir.exists():
         return "No sessions found."
