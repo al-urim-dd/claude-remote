@@ -15,6 +15,7 @@ import email.utils
 import json
 import logging
 import os
+import shutil
 import signal
 import subprocess
 import sys
@@ -52,6 +53,8 @@ MAX_RESPONSE_LEN = 50_000  # chars
 CLAUDE_CWD = "/Users/zhengli.sun/Projects"
 SUBJECT_PREFIX = "[claude]"
 REPLY_SENDER_NAME = "ClaudeRemote"  # Display name on reply emails
+ATTACHMENTS_DIR = CONFIG_DIR / "attachments"
+MAX_ATTACHMENT_SIZE = 10 * 1024 * 1024  # 10 MB per file
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -153,6 +156,7 @@ def get_message(service, msg_id: str) -> dict:
         "internal_date_ms": internal_date,
         "body": body,
         "label_ids": msg.get("labelIds", []),
+        "payload": msg["payload"],
     }
 
 
@@ -171,6 +175,123 @@ def _extract_body(payload: dict) -> str:
         return base64.urlsafe_b64decode(payload["body"]["data"]).decode("utf-8", errors="replace")
 
     return ""
+
+
+def _extract_attachments(service, msg_id: str, payload: dict) -> list[dict]:
+    """Download attachments from a message and save to disk.
+
+    Returns a list of dicts: {filename, path, mime_type, size}.
+    """
+    attachments = []
+    _walk_parts_for_attachments(service, msg_id, payload, attachments)
+    return attachments
+
+
+def _walk_parts_for_attachments(
+    service, msg_id: str, part: dict, results: list[dict]
+):
+    """Recursively walk MIME parts to find and download attachments."""
+    filename = part.get("filename")
+    body = part.get("body", {})
+    attachment_id = body.get("attachmentId")
+    size = body.get("size", 0)
+
+    if filename and attachment_id:
+        if size > MAX_ATTACHMENT_SIZE:
+            log.warning(
+                "Skipping oversized attachment %s (%d bytes) in message %s",
+                filename, size, msg_id,
+            )
+        else:
+            saved = _download_attachment(
+                service, msg_id, attachment_id, filename,
+                part.get("mimeType", "application/octet-stream"), size,
+            )
+            if saved:
+                results.append(saved)
+
+    for sub_part in part.get("parts", []):
+        _walk_parts_for_attachments(service, msg_id, sub_part, results)
+
+
+def _download_attachment(
+    service, msg_id: str, attachment_id: str, filename: str,
+    mime_type: str, size: int,
+) -> dict | None:
+    """Download a single attachment and save to ATTACHMENTS_DIR/<msg_id>/."""
+    try:
+        att = (
+            service.users()
+            .messages()
+            .attachments()
+            .get(userId="me", messageId=msg_id, id=attachment_id)
+            .execute()
+        )
+    except Exception:
+        log.exception("Failed to download attachment %s from message %s", filename, msg_id)
+        return None
+
+    data = base64.urlsafe_b64decode(att["data"])
+
+    save_dir = ATTACHMENTS_DIR / msg_id
+    save_dir.mkdir(parents=True, exist_ok=True)
+    filepath = save_dir / filename
+
+    filepath.write_bytes(data)
+    log.info("Saved attachment %s (%d bytes) to %s", filename, len(data), filepath)
+
+    return {
+        "filename": filename,
+        "path": str(filepath),
+        "mime_type": mime_type,
+        "size": len(data),
+    }
+
+
+def _build_prompt_with_attachments(body: str, attachments: list[dict]) -> str:
+    """Build a Claude prompt that references the user's message and any attachments."""
+    if not attachments:
+        return body
+
+    parts = [body, "", "---", "The following files were attached to this email:"]
+    for att in attachments:
+        category = _attachment_category(att["mime_type"])
+        parts.append(
+            f"- {att['filename']} ({att['mime_type']}, {att['size']} bytes): {att['path']}"
+        )
+        if category == "image":
+            parts.append(f"  ^ This is an image. Use your Read tool to view it at the path above.")
+        elif category == "text":
+            parts.append(f"  ^ This is a text/code file. Read it at the path above if needed.")
+        elif category == "pdf":
+            parts.append(f"  ^ This is a PDF. Use your Read tool to view it at the path above.")
+
+    parts.append("")
+    parts.append("Please analyze or use these files as appropriate for the request above.")
+
+    return "\n".join(parts)
+
+
+def _attachment_category(mime_type: str) -> str:
+    """Classify a MIME type into a broad category for prompt hinting."""
+    if mime_type.startswith("image/"):
+        return "image"
+    if mime_type == "application/pdf":
+        return "pdf"
+    if mime_type.startswith("text/") or mime_type in (
+        "application/json", "application/xml", "application/javascript",
+        "application/x-python", "application/x-sh",
+    ):
+        return "text"
+    return "binary"
+
+
+def _cleanup_attachments(msg_id: str):
+    """Remove downloaded attachments for a processed message."""
+    att_dir = ATTACHMENTS_DIR / msg_id
+    if att_dir.exists():
+        shutil.rmtree(att_dir)
+        log.info("Cleaned up attachments for message %s", msg_id)
 
 
 def send_reply(service, original_msg: dict, body_text: str, my_email: str):
@@ -402,17 +523,29 @@ def _poll_cycle(
             save_processed_id(msg_id)
             continue
 
-        # Extract the user's question
+        # Extract the user's question and any attachments
         body = msg["body"].strip()
-        if not body:
-            log.info("Skipping message %s with empty body", msg_id)
+
+        attachments = _extract_attachments(service, msg_id, msg["payload"])
+        if attachments:
+            log.info("Found %d attachment(s) in message %s", len(attachments), msg_id)
+
+        if not body and not attachments:
+            log.info("Skipping message %s with empty body and no attachments", msg_id)
             mark_as_read(service, msg_id)
             processed_ids.add(msg_id)
             save_processed_id(msg_id)
             continue
 
+        # If there are attachments but no body text, provide a default prompt
+        if not body and attachments:
+            body = "Please analyze the attached file(s)."
+
         thread_id = msg["thread_id"]
         log.info("Processing message %s in thread %s: %.80s", msg_id, thread_id, body)
+
+        # Build prompt with attachment references
+        prompt = _build_prompt_with_attachments(body, attachments)
 
         # Determine session: resume existing or start new
         resume = thread_id in thread_sessions
@@ -422,13 +555,13 @@ def _poll_cycle(
             session_id = str(uuid.uuid4())
 
         # Invoke Claude
-        response = invoke_claude(body, session_id, resume=resume)
+        response = invoke_claude(prompt, session_id, resume=resume)
 
         # If resume failed, retry without resume
         if resume and "[Claude exited with code" in response:
             log.warning("Resume failed for session %s, retrying fresh", session_id[:8])
             session_id = str(uuid.uuid4())
-            response = invoke_claude(body, session_id, resume=False)
+            response = invoke_claude(prompt, session_id, resume=False)
 
         # Reply in thread
         try:
@@ -436,6 +569,10 @@ def _poll_cycle(
             log.info("Replied to message %s (session=%s)", msg_id, session_id[:8])
         except Exception:
             log.exception("Failed to send reply for message %s", msg_id)
+
+        # Clean up downloaded attachments
+        if attachments:
+            _cleanup_attachments(msg_id)
 
         # Update state
         mark_as_read(service, msg_id)
