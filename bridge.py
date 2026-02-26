@@ -522,7 +522,7 @@ def _poll_cycle(
     """Single poll iteration."""
     cleanup_old_attachments()
 
-    query = f"subject:{SUBJECT_PREFIX} is:unread"
+    query = f"subject:{SUBJECT_PREFIX} newer_than:1d"
     messages = search_messages(service, query)
 
     if not messages:
