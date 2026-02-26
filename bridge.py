@@ -63,15 +63,22 @@ CLAUDE_SESSIONS_DIR = Path.home() / ".claude" / "projects"
 HELP_TEXT = """\
 Available commands and capabilities:
 
-/help — Show this help message
-/sessions — List recent Claude Code sessions
-/resume <session-id> — Resume a specific session
-/cancel — Cancel a running task (coming soon)
+/help -- Show this help message
+/sessions -- List recent Claude Code sessions
+/resume <session-id> -- Resume a specific session
+/cancel -- Cancel a running task (coming soon)
 
-Regular messages — Sent to Claude Code for processing
-Attachments — Attach files to emails and Claude will analyze them
-Calendar, email, docs — Claude has access to Google Workspace tools
-Multi-turn — Reply in the same thread to continue a conversation"""
+Regular messages -- Sent to Claude Code for processing
+Attachments -- Attach files to emails and Claude will analyze them
+Calendar, email, docs -- Claude has access to Google Workspace tools
+Multi-turn -- Reply in the same thread to continue a conversation"""
+
+DIGEST_ENABLED = True
+DIGEST_HOUR = 8  # Send digest at 8am local time
+DIGEST_LAST_SENT_FILE = CONFIG_DIR / "digest_last_sent.txt"
+
+# Module-level startup time (set in run_bridge)
+_startup_time: datetime | None = None
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -196,16 +203,12 @@ def _extract_body(payload: dict) -> str:
 
 
 def strip_quoted_reply(text: str) -> str:
-    """Strip Gmail/Outlook quoted reply text from an email body.
-
-    Gmail format:  On Mon, Jan 1, 2026 at 10:00 Name <email> wrote:
-    Outlook format: From: Name <email>
-    """
-    # Gmail-style: "On ... wrote:" — may span lines and have blank lines before it
+    """Strip Gmail/Outlook quoted reply text from an email body."""
+    # Gmail-style: "On ... wrote:" -- may span lines and have blank lines before it
     match = re.search(r'\n\s*On .+?wrote:\s*$', text, re.DOTALL | re.MULTILINE)
     if match:
         text = text[:match.start()]
-    # Outlook-style: "\nFrom: ..." block
+    # Outlook-style
     match = re.search(r'\n\s*From: .+\n', text)
     if match:
         text = text[:match.start()]
@@ -213,7 +216,7 @@ def strip_quoted_reply(text: str) -> str:
     match = re.search(r'\n-+ ?Forwarded message', text)
     if match:
         text = text[:match.start()]
-    # Strip any remaining > quoted lines at the end
+    # Strip trailing > quoted lines
     lines = text.rstrip().splitlines()
     while lines and lines[-1].lstrip().startswith(">"):
         lines.pop()
@@ -321,7 +324,7 @@ def build_thread_context(thread_messages: list[dict]) -> str:
             role = "User"
         body = msg["body"]
         if body:
-            parts.append(f"[{role} — {msg['date']}]\n{body}")
+            parts.append(f"[{role} -- {msg['date']}]\n{body}")
     return "\n\n---\n\n".join(parts)
 
 
@@ -422,7 +425,7 @@ def invoke_claude(
 
     # Truncate if too large
     if len(output) > MAX_RESPONSE_LEN:
-        output = output[:MAX_RESPONSE_LEN] + "\n\n[truncated — response exceeded 50K chars]"
+        output = output[:MAX_RESPONSE_LEN] + "\n\n[truncated -- response exceeded 50K chars]"
 
     return output
 
@@ -481,7 +484,7 @@ def save_processed_id(msg_id: str):
 
 
 def load_thread_sessions() -> dict[str, str]:
-    """Load thread→session mapping from JSON file."""
+    """Load thread->session mapping from JSON file."""
     if not SESSIONS_FILE.exists():
         return {}
     try:
@@ -491,8 +494,100 @@ def load_thread_sessions() -> dict[str, str]:
 
 
 def save_thread_sessions(sessions: dict[str, str]):
-    """Save thread→session mapping to JSON file."""
+    """Save thread->session mapping to JSON file."""
     SESSIONS_FILE.write_text(json.dumps(sessions, indent=2))
+
+
+# ---------------------------------------------------------------------------
+# Daily Digest
+# ---------------------------------------------------------------------------
+
+
+def get_pending_reviews() -> list[dict]:
+    """Get PRs requesting your review via the gh CLI."""
+    try:
+        result = subprocess.run(
+            ["gh", "search", "prs", "--review-requested=@me", "--state=open",
+             "--json", "number,title,repository,url,author", "--limit", "20"],
+            capture_output=True, text=True, timeout=30,
+        )
+        if result.returncode != 0 or not result.stdout.strip():
+            return []
+        prs = json.loads(result.stdout)
+        return [
+            {
+                "number": pr["number"],
+                "title": pr["title"],
+                "repo": pr.get("repository", {}).get("nameWithOwner", ""),
+                "url": pr["url"],
+                "author": pr.get("author", {}).get("login", "unknown"),
+            }
+            for pr in prs
+        ]
+    except (FileNotFoundError, subprocess.TimeoutExpired, json.JSONDecodeError):
+        return []
+
+
+def send_daily_digest(service, my_email: str, thread_sessions: dict, processed_count: int):
+    """Send a daily summary email with bridge stats and pending PRs."""
+    now = datetime.now()
+
+    # Check if we already sent today
+    if DIGEST_LAST_SENT_FILE.exists():
+        last_sent = DIGEST_LAST_SENT_FILE.read_text().strip()
+        if last_sent == now.strftime("%Y-%m-%d"):
+            return
+
+    active_threads = len(thread_sessions)
+
+    body = (
+        f"ClaudeRemote Daily Digest -- {now.strftime('%A, %B %d')}\n"
+        f"{'=' * 40}\n\n"
+        f"Messages processed today: {processed_count}\n"
+        f"Active thread sessions: {active_threads}\n"
+        f"Daemon PID: {os.getpid()}\n"
+        f"Uptime: since {_startup_time.strftime('%Y-%m-%d %H:%M') if _startup_time else 'unknown'}\n\n"
+    )
+
+    # PRs awaiting review
+    pending_prs = get_pending_reviews()
+    if pending_prs:
+        body += f"PRs Awaiting Your Review ({len(pending_prs)})\n"
+        body += "-" * 30 + "\n"
+        for pr in pending_prs:
+            body += f"  #{pr['number']} {pr['title']}\n"
+            body += f"    {pr['repo']} by {pr['author']}\n"
+            body += f"    {pr['url']}\n\n"
+    else:
+        body += "No PRs awaiting your review.\n\n"
+
+    body += (
+        "Commands:\n"
+        "  /sessions -- list recent sessions\n"
+        "  /help -- show all commands\n"
+        "  /status -- check bridge health\n"
+    )
+
+    message = MIMEText(body)
+    message["from"] = f"ClaudeRemote <{my_email}>"
+    message["to"] = my_email
+    message["subject"] = f"[ClaudeRemote] Daily Digest -- {now.strftime('%b %d')}"
+
+    raw = base64.urlsafe_b64encode(message.as_bytes()).decode("ascii")
+    service.users().messages().send(userId="me", body={"raw": raw}).execute()
+
+    DIGEST_LAST_SENT_FILE.write_text(now.strftime("%Y-%m-%d"))
+    log.info("Sent daily digest (%d pending PRs)", len(pending_prs))
+
+
+def _maybe_send_digest(service, my_email, thread_sessions, processed_count):
+    """Send digest if it is the right hour and has not been sent today."""
+    if not DIGEST_ENABLED:
+        return
+    now = datetime.now()
+    if now.hour != DIGEST_HOUR:
+        return
+    send_daily_digest(service, my_email, thread_sessions, processed_count)
 
 
 # ---------------------------------------------------------------------------
@@ -502,6 +597,7 @@ def save_thread_sessions(sessions: dict[str, str]):
 
 def run_bridge(foreground: bool = False):
     """Main loop: poll Gmail, process messages, reply."""
+    global _startup_time
     setup_logging(foreground=foreground)
     log.info("Starting ClaudeRemote")
 
@@ -520,9 +616,10 @@ def run_bridge(foreground: bool = False):
     processed_ids = load_processed_ids()
     thread_sessions = load_thread_sessions()
 
-    # Record startup time — ignore messages older than this
+    # Record startup time -- ignore messages older than this
     startup_time_ms = int(time.time() * 1000)
-    log.info("Startup time: %s (ignoring older messages)", datetime.now(timezone.utc).isoformat())
+    _startup_time = datetime.now(timezone.utc)
+    log.info("Startup time: %s (ignoring older messages)", _startup_time.isoformat())
     log.info("Loaded %d processed IDs, %d thread sessions", len(processed_ids), len(thread_sessions))
 
     # Graceful shutdown
@@ -565,6 +662,7 @@ def _poll_cycle(
 ):
     """Single poll iteration."""
     cleanup_old_attachments()
+    _maybe_send_digest(service, my_email, thread_sessions, len(processed_ids))
 
     query = f"subject:{SUBJECT_PREFIX} newer_than:1d"
     messages = search_messages(service, query)
@@ -611,7 +709,6 @@ def _poll_cycle(
 
         # Extract the user's question, stripping Gmail quoted reply text
         body = strip_quoted_reply(msg["body"].strip())
-        # Strip [claude] prefix from body and subject
         body = strip_claude_prefix(body)
         subject = strip_claude_prefix(msg["subject"])
         if not body and subject:
@@ -627,24 +724,22 @@ def _poll_cycle(
         log.info("Processing message %s in thread %s: %.80s", msg_id, thread_id, body)
 
         # Built-in commands: /help, /sessions, and /resume <id>
-        if body.lower().strip() == "/help":
+        if body.lower() == "/help":
             response = HELP_TEXT
             send_reply(service, msg, response, my_email)
             mark_as_read(service, msg_id)
             processed_ids.add(msg_id)
             save_processed_id(msg_id)
             continue
-
-        # /sessions and /resume <id>
-        if body.lower().strip() == "/sessions":
+        if body.lower() == "/sessions":
             response = list_sessions()
             send_reply(service, msg, response, my_email)
             mark_as_read(service, msg_id)
             processed_ids.add(msg_id)
             save_processed_id(msg_id)
             continue
-        if body.lower().strip().startswith("/resume "):
-            resume_id = body.strip().split(None, 1)[1].strip()
+        if body.lower().startswith("/resume "):
+            resume_id = body.split(None, 1)[1].strip()
             session_id = resume_id
             thread_sessions[thread_id] = session_id
             save_thread_sessions(thread_sessions)
