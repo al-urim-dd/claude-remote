@@ -15,6 +15,7 @@ import email.utils
 import json
 import logging
 import os
+import re
 import shutil
 import signal
 import subprocess
@@ -22,6 +23,7 @@ import sys
 import time
 import uuid
 from datetime import datetime, timezone
+from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from pathlib import Path
 
@@ -58,6 +60,53 @@ MAX_ATTACHMENT_SIZE = 10 * 1024 * 1024  # 10 MB
 ATTACHMENT_MAX_AGE_HOURS = 24
 PROGRESS_INTERVAL = 120  # seconds between "still working" emails
 CLAUDE_SESSIONS_DIR = Path.home() / ".claude" / "projects"
+
+HELP_TEXT = """\
+Available commands and capabilities:
+
+/help -- Show this help message
+/sessions -- List recent Claude Code sessions
+/resume <session-id> -- Resume a specific session
+/cancel -- Cancel a running task (coming soon)
+/summary -- Generate and send a work summary for today
+
+Regular messages -- Sent to Claude Code for processing
+Attachments -- Attach files to emails and Claude will analyze them
+Calendar, email, docs -- Claude has access to Google Workspace tools
+Multi-turn -- Reply in the same thread to continue a conversation"""
+
+DIGEST_ENABLED = True
+DIGEST_HOUR = 8  # Send digest at 8am local time
+DIGEST_LAST_SENT_FILE = CONFIG_DIR / "digest_last_sent.txt"
+
+CANCEL_FILE = CONFIG_DIR / "cancel.txt"
+
+RATE_LIMIT_PER_HOUR = 20  # Max Claude invocations per hour
+RATE_LIMIT_FILE = CONFIG_DIR / "rate_limit.json"  # Tracks invocation timestamps
+
+SUMMARY_ENABLED = True
+SUMMARY_HOUR = 16  # Send work summary at 4pm local time
+SUMMARY_LAST_SENT_FILE = CONFIG_DIR / "summary_last_sent.txt"
+SUMMARY_PROMPT = """\
+Generate a concise end-of-day work summary for today. Include:
+
+1. **PRs** — List PRs I created, reviewed, or merged today (use `gh` CLI)
+2. **Google Docs & Sheets** — Find documents I actually created or edited today (NOT just opened/viewed). Use `search_drive_files` with this query:
+   query="modifiedTime>'{today}T00:00:00' and ('me' in owners or 'me' in writers) and trashed=false"
+   This returns files modified today where I have write access. Exclude files where I'm only a viewer.
+   Group results by type (Docs, Sheets, Slides). Skip files that are clearly auto-generated or system files.
+3. **Calendar** — List meetings I had today and upcoming tomorrow (use Google Calendar)
+4. **Key activities** — Any other notable work (emails sent, Slack threads, etc.)
+
+Format it as a clean summary I can quickly scan on my phone. Use markdown.
+Keep it brief — highlight what matters, skip the noise.
+Today's date: {date}
+Today (YYYY-MM-DD): {today}
+My email: {email}"""
+
+# Module-level state (set in run_bridge)
+_startup_time: datetime | None = None
+_messages_processed: int = 0
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -181,6 +230,41 @@ def _extract_body(payload: dict) -> str:
     return ""
 
 
+def strip_quoted_reply(text: str) -> str:
+    """Strip Gmail/Outlook quoted reply text from an email body."""
+    # Gmail-style: "On ... wrote:" -- may span lines and have blank lines before it
+    match = re.search(r'\n\s*On .+?wrote:\s*$', text, re.DOTALL | re.MULTILINE)
+    if match:
+        text = text[:match.start()]
+    # Outlook-style
+    match = re.search(r'\n\s*From: .+\n', text)
+    if match:
+        text = text[:match.start()]
+    # Forwarded message blocks
+    match = re.search(r'\n-+ ?Forwarded message', text)
+    if match:
+        text = text[:match.start()]
+    # Strip trailing > quoted lines
+    lines = text.rstrip().splitlines()
+    while lines and lines[-1].lstrip().startswith(">"):
+        lines.pop()
+    return "\n".join(lines).strip()
+
+
+def strip_claude_prefix(text: str) -> str:
+    """Remove the [claude] subject prefix if present (case-insensitive)."""
+    return re.sub(r"^\[claude\]\s*", "", text, flags=re.IGNORECASE)
+
+
+def generate_subject(body: str, max_len: int = 50) -> str:
+    """Generate a short subject line from the user's message."""
+    first_line = body.split("\n")[0].strip()
+    first_line = re.sub(r'^\[claude\]\s*', '', first_line, flags=re.IGNORECASE)
+    if len(first_line) > max_len:
+        first_line = first_line[:max_len].rsplit(" ", 1)[0] + "..."
+    return f"[claude] {first_line}" if first_line else "[claude] conversation"
+
+
 def _extract_attachments(payload: dict) -> list[dict]:
     """Extract attachment metadata (filename, size, id) from a MIME payload."""
     attachments = []
@@ -277,15 +361,47 @@ def build_thread_context(thread_messages: list[dict]) -> str:
             role = "User"
         body = msg["body"]
         if body:
-            parts.append(f"[{role} — {msg['date']}]\n{body}")
+            parts.append(f"[{role} -- {msg['date']}]\n{body}")
     return "\n\n---\n\n".join(parts)
 
 
-def send_reply(service, original_msg: dict, body_text: str, my_email: str):
+def format_html_reply(text: str) -> str:
+    """Convert Claude's markdown output to email-safe HTML."""
+    import markdown
+    html_body = markdown.markdown(
+        text,
+        extensions=["fenced_code", "tables", "nl2br"],
+    )
+    style = (
+        "<style>"
+        "pre { background: #f6f8fa; padding: 12px; border-radius: 6px; overflow-x: auto; font-size: 13px; } "
+        "code { background: #f0f0f0; padding: 2px 6px; border-radius: 3px; font-size: 13px; font-family: 'SF Mono', Monaco, Consolas, monospace; } "
+        "pre code { background: none; padding: 0; } "
+        "table { border-collapse: collapse; margin: 8px 0; } "
+        "th, td { border: 1px solid #ddd; padding: 6px 12px; text-align: left; } "
+        "th { background: #f6f8fa; } "
+        "blockquote { border-left: 3px solid #ddd; margin: 8px 0; padding: 4px 12px; color: #555; }"
+        "</style>"
+    )
+    return (
+        "<html><body>\n"
+        "<div style=\"font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; "
+        "font-size: 14px; line-height: 1.6; color: #1a1a1a;\">\n"
+        + html_body + "\n"
+        "</div>\n"
+        + style + "\n"
+        "</body></html>"
+    )
+
+
+def send_reply(service, original_msg: dict, body_text: str, my_email: str, override_subject: str = None):
     """Reply to a message in the same thread with a distinct sender name."""
-    subject = original_msg["subject"]
-    if not subject.lower().startswith("re:"):
-        subject = f"Re: {subject}"
+    if override_subject:
+        subject = override_subject
+    else:
+        subject = original_msg["subject"]
+        if not subject.lower().startswith("re:"):
+            subject = f"Re: {subject}"
 
     # Build references chain for proper threading
     references = original_msg.get("references", "")
@@ -295,14 +411,23 @@ def send_reply(service, original_msg: dict, body_text: str, my_email: str):
         else:
             references = original_msg["message_id"]
 
-    message = MIMEText(body_text)
-    message["from"] = f"{REPLY_SENDER_NAME} <{my_email}>"
-    message["to"] = original_msg["from"]
-    message["subject"] = subject
-    message["In-Reply-To"] = original_msg.get("message_id", "")
-    message["References"] = references
+    # Use HTML if the body contains markdown-like content
+    has_markdown = any(marker in body_text for marker in ['```', '# ', '**', '- ', '| '])
 
-    raw = base64.urlsafe_b64encode(message.as_bytes()).decode("ascii")
+    if has_markdown:
+        msg_mime = MIMEMultipart("alternative")
+        msg_mime.attach(MIMEText(body_text, "plain"))
+        msg_mime.attach(MIMEText(format_html_reply(body_text), "html"))
+    else:
+        msg_mime = MIMEText(body_text)
+
+    msg_mime["from"] = f"{REPLY_SENDER_NAME} <{my_email}>"
+    msg_mime["to"] = original_msg["from"]
+    msg_mime["subject"] = subject
+    msg_mime["In-Reply-To"] = original_msg.get("message_id", "")
+    msg_mime["References"] = references
+
+    raw = base64.urlsafe_b64encode(msg_mime.as_bytes()).decode("ascii")
 
     sent = (
         service.users()
@@ -328,11 +453,24 @@ def mark_as_read(service, msg_id: str):
 # ---------------------------------------------------------------------------
 
 
+def _check_cancel(thread_id: str) -> bool:
+    """Check if thread_id is in the cancel file; remove it if found."""
+    if not CANCEL_FILE.exists():
+        return False
+    lines = CANCEL_FILE.read_text().strip().splitlines()
+    if thread_id in lines:
+        remaining = [t for t in lines if t != thread_id]
+        CANCEL_FILE.write_text("\n".join(remaining) + "\n" if remaining else "")
+        return True
+    return False
+
+
 def invoke_claude(
     message: str,
     session_id: str,
     resume: bool = False,
     on_progress: callable = None,
+    thread_id: str = None,
 ) -> str:
     """Run claude -p as a subprocess, sending progress callbacks while waiting."""
     env = os.environ.copy()
@@ -357,10 +495,21 @@ def invoke_claude(
         while proc.poll() is None:
             time.sleep(1)
             elapsed += 1
+            if thread_id and _check_cancel(thread_id):
+                proc.kill()
+                proc.wait()
+                log.info("Cancelled Claude for thread %s", thread_id)
+                return "[Cancelled by user]\n\nThe task was cancelled. Send a new message to start fresh."
             if elapsed >= CLAUDE_TIMEOUT:
                 proc.kill()
                 proc.wait()
-                output = f"[Claude timed out after {CLAUDE_TIMEOUT}s]"
+                output = (
+                    f"[Timed out after {CLAUDE_TIMEOUT // 60} minutes]\n\n"
+                    "The task was too long for a single request. You can:\n"
+                    "- Reply in this thread to continue where it left off\n"
+                    "- Break the task into smaller steps\n"
+                    "- Reply /resume to pick up the session"
+                )
                 log.warning("Claude timed out for session %s", session_id[:8])
                 break
             if on_progress and elapsed >= next_progress:
@@ -369,23 +518,35 @@ def invoke_claude(
         else:
             output = proc.stdout.read().strip()
             if proc.returncode != 0 and not output:
-                output = f"[Claude exited with code {proc.returncode}]\n{proc.stderr.read().strip()}"
+                stderr_text = proc.stderr.read().strip()
+                output = (
+                    f"[Claude exited with code {proc.returncode}]\n\n"
+                    + (f"Error: {stderr_text}\n\n" if stderr_text else "")
+                    + "Reply in this thread to retry, or start a new thread with [claude] prefix."
+                )
             if not output:
-                output = "[Claude returned empty output]"
+                output = (
+                    "[Claude returned empty output]\n\n"
+                    "This sometimes happens with very short tasks. Try rephrasing your request."
+                )
     except FileNotFoundError:
-        output = "[Error: 'claude' command not found. Is Claude Code installed?]"
+        output = (
+            "[Error: 'claude' command not found]\n\n"
+            "Claude Code doesn't appear to be installed or is not in PATH.\n"
+            "Install it: npm install -g @anthropic-ai/claude-code"
+        )
         log.error("claude command not found")
 
     # Truncate if too large
     if len(output) > MAX_RESPONSE_LEN:
-        output = output[:MAX_RESPONSE_LEN] + "\n\n[truncated — response exceeded 50K chars]"
+        output = output[:MAX_RESPONSE_LEN] + "\n\n[truncated -- response exceeded 50K chars]"
 
     return output
 
 
 def list_sessions(count: int = 10) -> str:
     """List recent Claude Code sessions by reading JSONL files from disk."""
-    cwd_slug = CLAUDE_CWD.replace("/", "-")
+    cwd_slug = CLAUDE_CWD.replace("/", "-").replace(".", "-")
     sessions_dir = CLAUDE_SESSIONS_DIR / cwd_slug
     if not sessions_dir.exists():
         return "No sessions found."
@@ -437,7 +598,7 @@ def save_processed_id(msg_id: str):
 
 
 def load_thread_sessions() -> dict[str, str]:
-    """Load thread→session mapping from JSON file."""
+    """Load thread->session mapping from JSON file."""
     if not SESSIONS_FILE.exists():
         return {}
     try:
@@ -447,8 +608,198 @@ def load_thread_sessions() -> dict[str, str]:
 
 
 def save_thread_sessions(sessions: dict[str, str]):
-    """Save thread→session mapping to JSON file."""
+    """Save thread->session mapping to JSON file."""
     SESSIONS_FILE.write_text(json.dumps(sessions, indent=2))
+
+
+# ---------------------------------------------------------------------------
+# Rate Limiting
+# ---------------------------------------------------------------------------
+
+
+def _check_rate_limit() -> tuple[bool, int]:
+    """Check if we're within the rate limit. Returns (allowed, remaining)."""
+    now = time.time()
+    cutoff = now - 3600  # 1 hour window
+
+    timestamps = []
+    if RATE_LIMIT_FILE.exists():
+        try:
+            timestamps = json.loads(RATE_LIMIT_FILE.read_text())
+        except (json.JSONDecodeError, ValueError):
+            timestamps = []
+
+    # Prune old entries
+    timestamps = [t for t in timestamps if t > cutoff]
+
+    remaining = RATE_LIMIT_PER_HOUR - len(timestamps)
+    return remaining > 0, max(remaining, 0)
+
+
+def _record_invocation():
+    """Record a Claude invocation timestamp for rate limiting."""
+    now = time.time()
+    cutoff = now - 3600
+
+    timestamps = []
+    if RATE_LIMIT_FILE.exists():
+        try:
+            timestamps = json.loads(RATE_LIMIT_FILE.read_text())
+        except (json.JSONDecodeError, ValueError):
+            timestamps = []
+
+    timestamps = [t for t in timestamps if t > cutoff]
+    timestamps.append(now)
+    RATE_LIMIT_FILE.write_text(json.dumps(timestamps))
+
+
+# ---------------------------------------------------------------------------
+# Daily Digest
+# ---------------------------------------------------------------------------
+
+
+def get_pending_reviews() -> list[dict]:
+    """Get PRs requesting your review via the gh CLI."""
+    try:
+        result = subprocess.run(
+            ["gh", "search", "prs", "--review-requested=@me", "--state=open",
+             "--json", "number,title,repository,url,author", "--limit", "20"],
+            capture_output=True, text=True, timeout=30,
+        )
+        if result.returncode != 0 or not result.stdout.strip():
+            return []
+        prs = json.loads(result.stdout)
+        return [
+            {
+                "number": pr["number"],
+                "title": pr["title"],
+                "repo": pr.get("repository", {}).get("nameWithOwner", ""),
+                "url": pr["url"],
+                "author": pr.get("author", {}).get("login", "unknown"),
+            }
+            for pr in prs
+        ]
+    except (FileNotFoundError, subprocess.TimeoutExpired, json.JSONDecodeError):
+        return []
+
+
+def send_daily_digest(service, my_email: str, thread_sessions: dict, processed_count: int):
+    """Send a daily summary email with bridge stats and pending PRs."""
+    now = datetime.now()
+
+    # Check if we already sent today
+    if DIGEST_LAST_SENT_FILE.exists():
+        last_sent = DIGEST_LAST_SENT_FILE.read_text().strip()
+        if last_sent == now.strftime("%Y-%m-%d"):
+            return
+
+    active_threads = len(thread_sessions)
+
+    body = (
+        f"ClaudeRemote Daily Digest -- {now.strftime('%A, %B %d')}\n"
+        f"{'=' * 40}\n\n"
+        f"Messages processed today: {processed_count}\n"
+        f"Active thread sessions: {active_threads}\n"
+        f"Daemon PID: {os.getpid()}\n"
+        f"Uptime: since {_startup_time.strftime('%Y-%m-%d %H:%M') if _startup_time else 'unknown'}\n\n"
+    )
+
+    # PRs awaiting review
+    pending_prs = get_pending_reviews()
+    if pending_prs:
+        body += f"PRs Awaiting Your Review ({len(pending_prs)})\n"
+        body += "-" * 30 + "\n"
+        for pr in pending_prs:
+            body += f"  #{pr['number']} {pr['title']}\n"
+            body += f"    {pr['repo']} by {pr['author']}\n"
+            body += f"    {pr['url']}\n\n"
+    else:
+        body += "No PRs awaiting your review.\n\n"
+
+    body += (
+        "Commands:\n"
+        "  /sessions -- list recent sessions\n"
+        "  /help -- show all commands\n"
+        "  /status -- check bridge health\n"
+    )
+
+    message = MIMEText(body)
+    message["from"] = f"ClaudeRemote <{my_email}>"
+    message["to"] = my_email
+    message["subject"] = f"[ClaudeRemote] Daily Digest -- {now.strftime('%b %d')}"
+
+    raw = base64.urlsafe_b64encode(message.as_bytes()).decode("ascii")
+    service.users().messages().send(userId="me", body={"raw": raw}).execute()
+
+    DIGEST_LAST_SENT_FILE.write_text(now.strftime("%Y-%m-%d"))
+    log.info("Sent daily digest (%d pending PRs)", len(pending_prs))
+
+
+def _maybe_send_digest(service, my_email, thread_sessions, processed_count):
+    """Send digest if it is the right hour and has not been sent today."""
+    if not DIGEST_ENABLED:
+        return
+    now = datetime.now()
+    if now.hour != DIGEST_HOUR:
+        return
+    send_daily_digest(service, my_email, thread_sessions, processed_count)
+
+
+# ---------------------------------------------------------------------------
+# Daily Work Summary
+# ---------------------------------------------------------------------------
+
+
+def send_work_summary(service, my_email: str):
+    """Invoke Claude to generate a work summary and email it to the user."""
+    now = datetime.now()
+
+    # Check if we already sent today
+    if SUMMARY_LAST_SENT_FILE.exists():
+        last_sent = SUMMARY_LAST_SENT_FILE.read_text().strip()
+        if last_sent == now.strftime("%Y-%m-%d"):
+            return
+
+    log.info("Generating daily work summary via Claude")
+
+    prompt = SUMMARY_PROMPT.format(
+        date=now.strftime("%Y-%m-%d (%A)"),
+        today=now.strftime("%Y-%m-%d"),
+        email=my_email,
+    )
+
+    session_id = str(uuid.uuid4())
+    summary = invoke_claude(prompt, session_id, resume=False)
+
+    if not summary or summary.startswith("["):
+        log.warning("Work summary generation failed: %s", summary[:100])
+        return
+
+    # Send as HTML email (Claude output is markdown)
+    html = format_html_reply(summary)
+
+    msg_mime = MIMEMultipart("alternative")
+    msg_mime.attach(MIMEText(summary, "plain"))
+    msg_mime.attach(MIMEText(html, "html"))
+    msg_mime["from"] = f"ClaudeRemote <{my_email}>"
+    msg_mime["to"] = my_email
+    msg_mime["subject"] = f"[ClaudeRemote] Work Summary -- {now.strftime('%b %d')}"
+
+    raw = base64.urlsafe_b64encode(msg_mime.as_bytes()).decode("ascii")
+    service.users().messages().send(userId="me", body={"raw": raw}).execute()
+
+    SUMMARY_LAST_SENT_FILE.write_text(now.strftime("%Y-%m-%d"))
+    log.info("Sent daily work summary")
+
+
+def _maybe_send_summary(service, my_email):
+    """Send work summary if it is the right hour and has not been sent today."""
+    if not SUMMARY_ENABLED:
+        return
+    now = datetime.now()
+    if now.hour != SUMMARY_HOUR:
+        return
+    send_work_summary(service, my_email)
 
 
 # ---------------------------------------------------------------------------
@@ -458,7 +809,9 @@ def save_thread_sessions(sessions: dict[str, str]):
 
 def run_bridge(foreground: bool = False):
     """Main loop: poll Gmail, process messages, reply."""
+    global _startup_time, _messages_processed
     setup_logging(foreground=foreground)
+    _messages_processed = 0
     log.info("Starting ClaudeRemote")
 
     # Authenticate
@@ -476,9 +829,10 @@ def run_bridge(foreground: bool = False):
     processed_ids = load_processed_ids()
     thread_sessions = load_thread_sessions()
 
-    # Record startup time — ignore messages older than this
+    # Record startup time -- ignore messages older than this
     startup_time_ms = int(time.time() * 1000)
-    log.info("Startup time: %s (ignoring older messages)", datetime.now(timezone.utc).isoformat())
+    _startup_time = datetime.now(timezone.utc)
+    log.info("Startup time: %s (ignoring older messages)", _startup_time.isoformat())
     log.info("Loaded %d processed IDs, %d thread sessions", len(processed_ids), len(thread_sessions))
 
     # Graceful shutdown
@@ -521,6 +875,8 @@ def _poll_cycle(
 ):
     """Single poll iteration."""
     cleanup_old_attachments()
+    _maybe_send_digest(service, my_email, thread_sessions, len(processed_ids))
+    _maybe_send_summary(service, my_email)
 
     query = f"subject:{SUBJECT_PREFIX} newer_than:1d"
     messages = search_messages(service, query)
@@ -565,8 +921,12 @@ def _poll_cycle(
         # Download attachments (if any)
         attachment_paths = download_attachments(service, msg_id, msg.get("attachments", []))
 
-        # Extract the user's question
-        body = msg["body"].strip()
+        # Extract the user's question, stripping Gmail quoted reply text
+        body = strip_quoted_reply(msg["body"].strip())
+        body = strip_claude_prefix(body)
+        subject = strip_claude_prefix(msg["subject"])
+        if not body and subject:
+            body = subject
         if not body and not attachment_paths:
             log.info("Skipping message %s with empty body and no attachments", msg_id)
             mark_as_read(service, msg_id)
@@ -577,16 +937,70 @@ def _poll_cycle(
         thread_id = msg["thread_id"]
         log.info("Processing message %s in thread %s: %.80s", msg_id, thread_id, body)
 
-        # Built-in commands: /sessions and /resume <id>
-        if body.lower().strip() == "/sessions":
+        # Built-in commands: /help, /status, /cancel, /sessions, /resume <id>
+        if body.lower() == "/help":
+            response = HELP_TEXT
+            send_reply(service, msg, response, my_email)
+            mark_as_read(service, msg_id)
+            processed_ids.add(msg_id)
+            save_processed_id(msg_id)
+            continue
+        if body.lower() == "/status":
+            global _messages_processed
+            uptime = datetime.now(timezone.utc) - _startup_time if _startup_time else None
+            if uptime:
+                hours, remainder = divmod(int(uptime.total_seconds()), 3600)
+                minutes, seconds = divmod(remainder, 60)
+                uptime_str = f"{hours}h {minutes}m {seconds}s"
+            else:
+                uptime_str = "unknown"
+            current_session = thread_sessions.get(thread_id, "none")
+            response = (
+                f"ClaudeRemote Status\n"
+                f"---\n"
+                f"Uptime: {uptime_str}\n"
+                f"Messages processed: {_messages_processed}\n"
+                f"Active threads: {len(thread_sessions)}\n"
+                f"This thread's session: {current_session}\n"
+                f"PID: {os.getpid()}"
+            )
+            send_reply(service, msg, response, my_email)
+            mark_as_read(service, msg_id)
+            processed_ids.add(msg_id)
+            save_processed_id(msg_id)
+            continue
+        if body.lower() == "/cancel":
+            with open(CANCEL_FILE, "a") as f:
+                f.write(thread_id + "\n")
+            response = "Cancel requested. If a task is running in this thread, it will be stopped."
+            send_reply(service, msg, response, my_email)
+            mark_as_read(service, msg_id)
+            processed_ids.add(msg_id)
+            save_processed_id(msg_id)
+            continue
+        if body.lower() == "/summary":
+            log.info("Manual work summary requested")
+            prompt = SUMMARY_PROMPT.format(
+                date=datetime.now().strftime("%Y-%m-%d (%A)"),
+                today=datetime.now().strftime("%Y-%m-%d"),
+                email=my_email,
+            )
+            session_id = str(uuid.uuid4())
+            response = invoke_claude(prompt, session_id, resume=False)
+            send_reply(service, msg, response, my_email)
+            mark_as_read(service, msg_id)
+            processed_ids.add(msg_id)
+            save_processed_id(msg_id)
+            continue
+        if body.lower() == "/sessions":
             response = list_sessions()
             send_reply(service, msg, response, my_email)
             mark_as_read(service, msg_id)
             processed_ids.add(msg_id)
             save_processed_id(msg_id)
             continue
-        if body.lower().strip().startswith("/resume "):
-            resume_id = body.strip().split(None, 1)[1].strip()
+        if body.lower().startswith("/resume "):
+            resume_id = body.split(None, 1)[1].strip()
             session_id = resume_id
             thread_sessions[thread_id] = session_id
             save_thread_sessions(thread_sessions)
@@ -639,8 +1053,25 @@ def _poll_cycle(
             except Exception:
                 log.exception("Failed to send progress email")
 
+        # Rate limit check
+        allowed, remaining = _check_rate_limit()
+        if not allowed:
+            response = (
+                "[Rate limit reached]\n\n"
+                f"You've used {RATE_LIMIT_PER_HOUR} Claude invocations in the last hour.\n"
+                "Wait a bit and try again, or adjust RATE_LIMIT_PER_HOUR in bridge.py."
+            )
+            send_reply(service, msg, response, my_email)
+            mark_as_read(service, msg_id)
+            processed_ids.add(msg_id)
+            save_processed_id(msg_id)
+            continue
+
+        log.info("Rate limit: %d/%d remaining", remaining, RATE_LIMIT_PER_HOUR)
+
         # Invoke Claude
-        response = invoke_claude(prompt, session_id, resume=resume, on_progress=on_progress)
+        response = invoke_claude(prompt, session_id, resume=resume, on_progress=on_progress, thread_id=thread_id)
+        _record_invocation()
 
         # If resume failed, retry with full thread context on a fresh session
         if resume and "[Claude exited with code" in response:
@@ -656,11 +1087,16 @@ def _poll_cycle(
                 )
             else:
                 prompt = att_preamble + body
-            response = invoke_claude(prompt, session_id, resume=False, on_progress=on_progress)
+            response = invoke_claude(prompt, session_id, resume=False, on_progress=on_progress, thread_id=thread_id)
+            _record_invocation()
 
-        # Reply in thread
+        # Reply in thread -- override subject on first reply in new thread
         try:
-            send_reply(service, msg, response, my_email)
+            if not resume:
+                new_subject = generate_subject(body)
+                send_reply(service, msg, response, my_email, override_subject=f"Re: {new_subject}")
+            else:
+                send_reply(service, msg, response, my_email)
             log.info("Replied to message %s (session=%s)", msg_id, session_id[:8])
         except Exception:
             log.exception("Failed to send reply for message %s", msg_id)
@@ -671,6 +1107,7 @@ def _poll_cycle(
         save_processed_id(msg_id)
         thread_sessions[thread_id] = session_id
         save_thread_sessions(thread_sessions)
+        _messages_processed += 1
 
 
 # ---------------------------------------------------------------------------
