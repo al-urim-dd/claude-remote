@@ -95,10 +95,11 @@ Generate a concise end-of-day work summary for today. Include:
    - PRs I reviewed: `gh search prs --reviewed-by=@me --updated=">={yesterday}" --json number,title,repository,url,author`
    - PRs requesting my review: `gh search prs --review-requested=@me --state=open --json number,title,repository,url,author`
    Combine and deduplicate the results. Label each as (authored/reviewed/needs review).
-2. **Google Docs & Sheets** — Find documents I actually created or edited today (NOT just opened/viewed). Use `search_drive_files` with this query:
-   query="modifiedTime>'{today}T00:00:00' and ('me' in owners or 'me' in writers) and trashed=false"
-   This returns files modified today where I have write access. Exclude files where I'm only a viewer.
-   Group results by type (Docs, Sheets, Slides). Skip files that are clearly auto-generated or system files.
+2. **Google Docs & Sheets** — Find documents I actually edited today. Two-step process:
+   Step A: Use `search_drive_files` with query="modifiedTime>'{today}T00:00:00' and trashed=false" and from="{email}" to find files last modified by me today.
+   Step B: If Step A returns no results or too many, try query="modifiedTime>'{today}T00:00:00' and 'me' in owners and trashed=false" to at least find docs I own that were modified today.
+   IMPORTANT: Do NOT include documents I merely have access to but didn't edit. The `from` filter in search_drive_files specifically means "modified by this person", which is what we want.
+   Group results by type (Docs, Sheets, Slides). Skip auto-generated or system files.
 3. **Calendar** — List meetings I had today and upcoming tomorrow (use Google Calendar with detailed=True to get attendee response status). Only include events where my responseStatus is "accepted" or "tentative" — exclude events I declined ("declined") or haven't responded to ("needsAction").
 4. **Key activities** — Any other notable work (emails sent, Slack threads, etc.)
 
