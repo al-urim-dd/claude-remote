@@ -83,6 +83,21 @@ CANCEL_FILE = CONFIG_DIR / "cancel.txt"
 RATE_LIMIT_PER_HOUR = 20  # Max Claude invocations per hour
 RATE_LIMIT_FILE = CONFIG_DIR / "rate_limit.json"  # Tracks invocation timestamps
 
+SUMMARY_ENABLED = True
+SUMMARY_HOUR = 16  # Send work summary at 4pm local time
+SUMMARY_LAST_SENT_FILE = CONFIG_DIR / "summary_last_sent.txt"
+SUMMARY_PROMPT = """\
+Generate a concise end-of-day work summary for today. Include:
+
+1. **PRs** — List PRs I created, reviewed, or merged today (use `gh` CLI)
+2. **Calendar** — List meetings I had today and upcoming tomorrow (use Google Calendar)
+3. **Key activities** — Any other notable work (docs edited, emails sent, etc.)
+
+Format it as a clean summary I can quickly scan on my phone. Use markdown.
+Keep it brief — highlight what matters, skip the noise.
+Today's date: {date}
+My email: {email}"""
+
 # Module-level state (set in run_bridge)
 _startup_time: datetime | None = None
 _messages_processed: int = 0
@@ -725,6 +740,62 @@ def _maybe_send_digest(service, my_email, thread_sessions, processed_count):
 
 
 # ---------------------------------------------------------------------------
+# Daily Work Summary
+# ---------------------------------------------------------------------------
+
+
+def send_work_summary(service, my_email: str):
+    """Invoke Claude to generate a work summary and email it to the user."""
+    now = datetime.now()
+
+    # Check if we already sent today
+    if SUMMARY_LAST_SENT_FILE.exists():
+        last_sent = SUMMARY_LAST_SENT_FILE.read_text().strip()
+        if last_sent == now.strftime("%Y-%m-%d"):
+            return
+
+    log.info("Generating daily work summary via Claude")
+
+    prompt = SUMMARY_PROMPT.format(
+        date=now.strftime("%Y-%m-%d (%A)"),
+        email=my_email,
+    )
+
+    session_id = f"summary-{now.strftime('%Y%m%d')}"
+    summary = invoke_claude(prompt, session_id, resume=False)
+
+    if not summary or summary.startswith("["):
+        log.warning("Work summary generation failed: %s", summary[:100])
+        return
+
+    # Send as HTML email (Claude output is markdown)
+    html = format_html_reply(summary)
+
+    msg_mime = MIMEMultipart("alternative")
+    msg_mime.attach(MIMEText(summary, "plain"))
+    msg_mime.attach(MIMEText(html, "html"))
+    msg_mime["from"] = f"ClaudeRemote <{my_email}>"
+    msg_mime["to"] = my_email
+    msg_mime["subject"] = f"[ClaudeRemote] Work Summary -- {now.strftime('%b %d')}"
+
+    raw = base64.urlsafe_b64encode(msg_mime.as_bytes()).decode("ascii")
+    service.users().messages().send(userId="me", body={"raw": raw}).execute()
+
+    SUMMARY_LAST_SENT_FILE.write_text(now.strftime("%Y-%m-%d"))
+    log.info("Sent daily work summary")
+
+
+def _maybe_send_summary(service, my_email):
+    """Send work summary if it is the right hour and has not been sent today."""
+    if not SUMMARY_ENABLED:
+        return
+    now = datetime.now()
+    if now.hour != SUMMARY_HOUR:
+        return
+    send_work_summary(service, my_email)
+
+
+# ---------------------------------------------------------------------------
 # Main Polling Loop
 # ---------------------------------------------------------------------------
 
@@ -798,6 +869,7 @@ def _poll_cycle(
     """Single poll iteration."""
     cleanup_old_attachments()
     _maybe_send_digest(service, my_email, thread_sessions, len(processed_ids))
+    _maybe_send_summary(service, my_email)
 
     query = f"subject:{SUBJECT_PREFIX} newer_than:1d"
     messages = search_messages(service, query)
