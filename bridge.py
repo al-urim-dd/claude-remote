@@ -91,13 +91,17 @@ SUMMARY_PROMPT = """\
 Generate a concise end-of-day work summary for today. Include:
 
 1. **PRs** — List PRs I created, reviewed, or merged today (use `gh` CLI)
-2. **Google Docs** — List Google Docs I created or edited today (use Google Drive API to search for docs modified today owned by or edited by me)
+2. **Google Docs & Sheets** — Find documents I actually created or edited today (NOT just opened/viewed). Use `search_drive_files` with this query:
+   query="modifiedTime>'{today}T00:00:00' and ('me' in owners or 'me' in writers) and trashed=false"
+   This returns files modified today where I have write access. Exclude files where I'm only a viewer.
+   Group results by type (Docs, Sheets, Slides). Skip files that are clearly auto-generated or system files.
 3. **Calendar** — List meetings I had today and upcoming tomorrow (use Google Calendar)
 4. **Key activities** — Any other notable work (emails sent, Slack threads, etc.)
 
 Format it as a clean summary I can quickly scan on my phone. Use markdown.
 Keep it brief — highlight what matters, skip the noise.
 Today's date: {date}
+Today (YYYY-MM-DD): {today}
 My email: {email}"""
 
 # Module-level state (set in run_bridge)
@@ -760,6 +764,7 @@ def send_work_summary(service, my_email: str):
 
     prompt = SUMMARY_PROMPT.format(
         date=now.strftime("%Y-%m-%d (%A)"),
+        today=now.strftime("%Y-%m-%d"),
         email=my_email,
     )
 
@@ -977,6 +982,7 @@ def _poll_cycle(
             log.info("Manual work summary requested")
             prompt = SUMMARY_PROMPT.format(
                 date=datetime.now().strftime("%Y-%m-%d (%A)"),
+                today=datetime.now().strftime("%Y-%m-%d"),
                 email=my_email,
             )
             session_id = str(uuid.uuid4())
