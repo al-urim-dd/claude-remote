@@ -95,7 +95,7 @@ Generate a concise end-of-day work summary for today. Include:
    query="modifiedTime>'{today}T00:00:00' and ('me' in owners or 'me' in writers) and trashed=false"
    This returns files modified today where I have write access. Exclude files where I'm only a viewer.
    Group results by type (Docs, Sheets, Slides). Skip files that are clearly auto-generated or system files.
-3. **Calendar** — List meetings I had today and upcoming tomorrow (use Google Calendar)
+3. **Calendar** — List meetings I had today and upcoming tomorrow (use Google Calendar with detailed=True to get attendee response status). Only include events where my responseStatus is "accepted" or "tentative" — exclude events I declined ("declined") or haven't responded to ("needsAction").
 4. **Key activities** — Any other notable work (emails sent, Slack threads, etc.)
 
 Format it as a clean summary I can quickly scan on my phone. Use markdown.
