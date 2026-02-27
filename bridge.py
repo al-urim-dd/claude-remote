@@ -90,7 +90,11 @@ SUMMARY_LAST_SENT_FILE = CONFIG_DIR / "summary_last_sent.txt"
 SUMMARY_PROMPT = """\
 Generate a concise end-of-day work summary for today. Include:
 
-1. **PRs** — List PRs I created, reviewed, or merged today (use `gh` CLI)
+1. **PRs** — Use `gh` CLI to find PRs I worked on today. Run ALL of these commands:
+   - PRs I authored: `gh search prs --author=@me --updated=">={yesterday}" --json number,title,repository,url,state`
+   - PRs I reviewed: `gh search prs --reviewed-by=@me --updated=">={yesterday}" --json number,title,repository,url,author`
+   - PRs requesting my review: `gh search prs --review-requested=@me --state=open --json number,title,repository,url,author`
+   Combine and deduplicate the results. Label each as (authored/reviewed/needs review).
 2. **Google Docs & Sheets** — Find documents I actually created or edited today (NOT just opened/viewed). Use `search_drive_files` with this query:
    query="modifiedTime>'{today}T00:00:00' and ('me' in owners or 'me' in writers) and trashed=false"
    This returns files modified today where I have write access. Exclude files where I'm only a viewer.
@@ -762,9 +766,11 @@ def send_work_summary(service, my_email: str):
 
     log.info("Generating daily work summary via Claude")
 
+    from datetime import timedelta
     prompt = SUMMARY_PROMPT.format(
         date=now.strftime("%Y-%m-%d (%A)"),
         today=now.strftime("%Y-%m-%d"),
+        yesterday=(now - timedelta(days=1)).strftime("%Y-%m-%d"),
         email=my_email,
     )
 
@@ -980,9 +986,12 @@ def _poll_cycle(
             continue
         if body.lower() == "/summary":
             log.info("Manual work summary requested")
+            from datetime import timedelta
+            _now = datetime.now()
             prompt = SUMMARY_PROMPT.format(
-                date=datetime.now().strftime("%Y-%m-%d (%A)"),
-                today=datetime.now().strftime("%Y-%m-%d"),
+                date=_now.strftime("%Y-%m-%d (%A)"),
+                today=_now.strftime("%Y-%m-%d"),
+                yesterday=(_now - timedelta(days=1)).strftime("%Y-%m-%d"),
                 email=my_email,
             )
             session_id = str(uuid.uuid4())
