@@ -91,8 +91,9 @@ SUMMARY_PROMPT = """\
 Generate a concise end-of-day work summary for today. Include:
 
 1. **PRs** — List PRs I created, reviewed, or merged today (use `gh` CLI)
-2. **Calendar** — List meetings I had today and upcoming tomorrow (use Google Calendar)
-3. **Key activities** — Any other notable work (docs edited, emails sent, etc.)
+2. **Google Docs** — List Google Docs I created or edited today (use Google Drive API to search for docs modified today owned by or edited by me)
+3. **Calendar** — List meetings I had today and upcoming tomorrow (use Google Calendar)
+4. **Key activities** — Any other notable work (emails sent, Slack threads, etc.)
 
 Format it as a clean summary I can quickly scan on my phone. Use markdown.
 Keep it brief — highlight what matters, skip the noise.
