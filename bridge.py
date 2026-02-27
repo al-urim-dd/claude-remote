@@ -68,6 +68,7 @@ Available commands and capabilities:
 /sessions -- List recent Claude Code sessions
 /resume <session-id> -- Resume a specific session
 /cancel -- Cancel a running task (coming soon)
+/summary -- Generate and send a work summary for today
 
 Regular messages -- Sent to Claude Code for processing
 Attachments -- Attach files to emails and Claude will analyze them
@@ -966,6 +967,19 @@ def _poll_cycle(
             with open(CANCEL_FILE, "a") as f:
                 f.write(thread_id + "\n")
             response = "Cancel requested. If a task is running in this thread, it will be stopped."
+            send_reply(service, msg, response, my_email)
+            mark_as_read(service, msg_id)
+            processed_ids.add(msg_id)
+            save_processed_id(msg_id)
+            continue
+        if body.lower() == "/summary":
+            log.info("Manual work summary requested")
+            prompt = SUMMARY_PROMPT.format(
+                date=datetime.now().strftime("%Y-%m-%d (%A)"),
+                email=my_email,
+            )
+            session_id = f"summary-manual-{int(time.time())}"
+            response = invoke_claude(prompt, session_id, resume=False)
             send_reply(service, msg, response, my_email)
             mark_as_read(service, msg_id)
             processed_ids.add(msg_id)
