@@ -762,7 +762,7 @@ def send_work_summary(service, my_email: str):
         email=my_email,
     )
 
-    session_id = f"summary-{now.strftime('%Y%m%d')}"
+    session_id = str(uuid.uuid4())
     summary = invoke_claude(prompt, session_id, resume=False)
 
     if not summary or summary.startswith("["):
@@ -978,7 +978,7 @@ def _poll_cycle(
                 date=datetime.now().strftime("%Y-%m-%d (%A)"),
                 email=my_email,
             )
-            session_id = f"summary-manual-{int(time.time())}"
+            session_id = str(uuid.uuid4())
             response = invoke_claude(prompt, session_id, resume=False)
             send_reply(service, msg, response, my_email)
             mark_as_read(service, msg_id)
