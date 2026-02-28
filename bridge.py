@@ -1223,11 +1223,16 @@ def start_daemon():
     if PID_FILE.exists():
         PID_FILE.unlink()
 
-    # Fork into background.  Child inherits lock_fd.
+    # Fork into background.
     pid = os.fork()
     if pid > 0:
-        # Parent — lock_fd closes when parent exits, but child still
-        # holds a reference to the same open-file-description.
+        # Parent: wait until grandchild writes PID file (proving it
+        # acquired its own lock), then release ours and exit.
+        for _ in range(40):
+            time.sleep(0.25)
+            if PID_FILE.exists():
+                break
+        lock_fd.close()
         print(f"Bridge started (PID {pid})")
         print(f"Logs: {LOG_FILE}")
         return
