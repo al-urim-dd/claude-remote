@@ -1168,17 +1168,23 @@ def _find_bridge_pids():
 
 
 def _kill_pids(pids):
-    """Send SIGTERM to *pids* and wait up to 5 s for them to exit."""
+    """Send SIGTERM to *pids*, wait up to 3 s, then SIGKILL survivors."""
     for pid in pids:
         try:
             os.kill(pid, signal.SIGTERM)
         except OSError:
             pass
-    for _ in range(10):
-        alive = [p for p in pids if _pid_alive(p)]
-        if not alive:
+    for _ in range(6):
+        if not any(_pid_alive(p) for p in pids):
             return
         time.sleep(0.5)
+    # SIGKILL anything still alive.
+    for pid in pids:
+        if _pid_alive(pid):
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except OSError:
+                pass
 
 
 def _pid_alive(pid):
@@ -1206,12 +1212,7 @@ def start_daemon():
         print(f"Bridge already running (PID {pid})")
         return
 
-    # Lock acquired — kill any orphaned bridge processes.
-    orphans = _find_bridge_pids()
-    if orphans:
-        print(f"Killing orphaned bridge process(es): {orphans}")
-        _kill_pids(orphans)
-
+    # Lock acquired — no other daemon is running.
     # Clean stale PID file.
     if PID_FILE.exists():
         PID_FILE.unlink()
@@ -1234,6 +1235,17 @@ def start_daemon():
         os._exit(0)
 
     # Grandchild — the actual daemon.
+    # Close inherited lock fd — its flock will be released when the
+    # parent exits (flock is per open-file-description, not per fd).
+    # Acquire our OWN independent flock instead.
+    lock_fd.close()
+    LOCK_FILE.touch(exist_ok=True)
+    daemon_lock = open(LOCK_FILE, "w")
+    try:
+        fcntl.flock(daemon_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        os._exit(1)
+
     # Redirect stdio.
     sys.stdin.close()
     sys.stdout = open(os.devnull, "w")
@@ -1247,7 +1259,7 @@ def start_daemon():
     finally:
         if PID_FILE.exists():
             PID_FILE.unlink()
-        lock_fd.close()
+        daemon_lock.close()
 
 
 def stop_daemon():
