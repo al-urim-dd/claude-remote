@@ -1174,6 +1174,22 @@ def start_daemon():
     grandchild, so there is no race window where a second instance can
     slip through.
     """
+    # Kill any orphan bridge processes before attempting to start.
+    orphans = _find_bridge_pids()
+    for pid in orphans:
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except OSError:
+            pass
+    if orphans:
+        time.sleep(0.5)
+        for pid in orphans:
+            if _pid_alive(pid):
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                except OSError:
+                    pass
+
     LOCK_FILE.touch(exist_ok=True)
     lock_fd = open(LOCK_FILE, "r+")
     try:
@@ -1268,8 +1284,6 @@ def stop_daemon():
     print("Bridge stopped")
     if PID_FILE.exists():
         PID_FILE.unlink()
-
-
 
 
 # ---------------------------------------------------------------------------
