@@ -288,7 +288,7 @@ class TestSendReplyFromName:
     def test_from_header_has_display_name(self):
         """Verify the MIME message has ClaudeRemote as display name."""
         original_msg = {
-            "subject": "[claude] test",
+            "subject": "cc test",
             "from": "Zhengli Sun <zhengli.sun@doordash.com>",
             "message_id": "<abc@gmail.com>",
             "references": "",
@@ -309,7 +309,7 @@ class TestSendReplyFromName:
         decoded = base64.urlsafe_b64decode(raw).decode()
 
         assert f"{bridge.REPLY_SENDER_NAME} <{my_email}>" in decoded
-        assert "Re: [claude] test" in decoded
+        assert "Re: cc test" in decoded
 
 
 # ---------------------------------------------------------------------------
@@ -338,25 +338,28 @@ class TestPreStartupSafety:
 
 
 class TestStripClaudePrefix:
-    """Tests for stripping the [claude] prefix from body and subject."""
+    """Tests for stripping the 'cc' prefix from body and subject."""
 
     def test_strip_lowercase_prefix(self):
-        assert bridge.strip_claude_prefix("[claude] what time is it?") == "what time is it?"
+        assert bridge.strip_claude_prefix("cc what time is it?") == "what time is it?"
 
     def test_strip_mixed_case_prefix(self):
-        assert bridge.strip_claude_prefix("[Claude] hello") == "hello"
+        assert bridge.strip_claude_prefix("Cc hello") == "hello"
 
     def test_no_prefix_unchanged(self):
         assert bridge.strip_claude_prefix("no prefix here") == "no prefix here"
 
     def test_prefix_only_yields_empty(self):
-        assert bridge.strip_claude_prefix("[claude]") == ""
+        assert bridge.strip_claude_prefix("cc") == ""
 
     def test_prefix_with_extra_spaces(self):
-        assert bridge.strip_claude_prefix("[claude]   spaced out") == "spaced out"
+        assert bridge.strip_claude_prefix("cc   spaced out") == "spaced out"
 
     def test_uppercase_prefix(self):
-        assert bridge.strip_claude_prefix("[CLAUDE] shout") == "shout"
+        assert bridge.strip_claude_prefix("CC shout") == "shout"
+
+    def test_cc_inside_word_unchanged(self):
+        assert bridge.strip_claude_prefix("account info") == "account info"
 
 
 # ---------------------------------------------------------------------------
@@ -528,22 +531,22 @@ class TestDailyDigest:
 class TestGenerateSubject:
     def test_short_message(self):
         result = bridge.generate_subject("How do I fix the login bug?")
-        assert result == "[claude] How do I fix the login bug?"
+        assert result == "cc How do I fix the login bug?"
 
     def test_long_message_truncated(self):
         long_msg = "Please refactor the authentication module to use OAuth2 instead of the legacy token system"
         result = bridge.generate_subject(long_msg)
         assert result.endswith("...")
-        assert len(result) <= 60  # [claude] prefix + 50 + ...
+        assert len(result) <= 57  # "cc " prefix + 50 + ...
 
-    def test_claude_prefix_stripped(self):
-        result = bridge.generate_subject("[claude] deploy the new service")
-        assert result == "[claude] deploy the new service"
-        assert "[claude] [claude]" not in result
+    def test_cc_prefix_stripped(self):
+        result = bridge.generate_subject("cc deploy the new service")
+        assert result == "cc deploy the new service"
+        assert "cc cc" not in result
 
     def test_empty_message_fallback(self):
-        assert bridge.generate_subject("") == "[claude] conversation"
-        assert bridge.generate_subject("   ") == "[claude] conversation"
+        assert bridge.generate_subject("") == "cc conversation"
+        assert bridge.generate_subject("   ") == "cc conversation"
 
 # ---------------------------------------------------------------------------
 # invoke_claude error messages
@@ -634,7 +637,7 @@ class TestFormatHtmlReply:
     def test_plain_text_no_markdown(self):
         """Simple text without markdown markers stays as plain MIMEText."""
         original_msg = {
-            "subject": "[claude] test",
+            "subject": "cc test",
             "from": "User <user@example.com>",
             "message_id": "<abc@gmail.com>",
             "references": "",

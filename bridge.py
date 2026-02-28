@@ -1,7 +1,7 @@
 #!/Users/zhengli.sun/Projects/claude-remote/.venv/bin/python
 """ClaudeRemote: Gmail remote interface for Claude Code.
 
-Polls Gmail for emails with [claude] subject prefix, feeds them to Claude Code
+Polls Gmail for emails with "cc" subject prefix, feeds them to Claude Code
 via subprocess, and replies in the same email thread.
 
 Usage:
@@ -53,7 +53,7 @@ POLL_INTERVAL = 30  # seconds
 CLAUDE_TIMEOUT = 600  # 10 minutes
 MAX_RESPONSE_LEN = 50_000  # chars
 CLAUDE_CWD = "/Users/zhengli.sun/Projects"
-SUBJECT_PREFIX = "[claude]"
+SUBJECT_PREFIX = "cc"
 REPLY_SENDER_NAME = "ClaudeRemote"  # Display name on reply emails
 ATTACHMENTS_DIR = CONFIG_DIR / "attachments"
 MAX_ATTACHMENT_SIZE = 10 * 1024 * 1024  # 10 MB
@@ -90,12 +90,17 @@ SUMMARY_LAST_SENT_FILE = CONFIG_DIR / "summary_last_sent.txt"
 SUMMARY_PROMPT = """\
 Generate a concise end-of-day work summary for today. Include:
 
-1. **PRs** — List PRs I created, reviewed, or merged today (use `gh` CLI)
-2. **Google Docs & Sheets** — Find documents I actually created or edited today (NOT just opened/viewed). Use `search_drive_files` with this query:
-   query="modifiedTime>'{today}T00:00:00' and ('me' in owners or 'me' in writers) and trashed=false"
-   This returns files modified today where I have write access. Exclude files where I'm only a viewer.
-   Group results by type (Docs, Sheets, Slides). Skip files that are clearly auto-generated or system files.
-3. **Calendar** — List meetings I had today and upcoming tomorrow (use Google Calendar)
+1. **PRs** — Use `gh` CLI to find PRs I worked on today. Run ALL of these commands:
+   - PRs I authored: `gh search prs --author=@me --updated=">={yesterday}" --json number,title,repository,url,state`
+   - PRs I reviewed: `gh search prs --reviewed-by=@me --updated=">={yesterday}" --json number,title,repository,url,author`
+   - PRs requesting my review: `gh search prs --review-requested=@me --state=open --json number,title,repository,url,author`
+   Combine and deduplicate the results. Label each as (authored/reviewed/needs review).
+2. **Documents I edited today** — Use Glean search (NOT Google Drive API) to find docs I actually edited.
+   Use the `search` tool with query="*", from="me", updated="today", and type="spreadsheet" for sheets or leave type empty for all docs.
+   Glean's `from` filter tracks actual editing activity, not just access permissions.
+   If Glean returns no results, fall back to `search_drive_files` with query="modifiedTime>'{today}T00:00:00' and 'me' in owners and trashed=false".
+   Only include documents where I made actual changes. Skip auto-generated or system files.
+3. **Calendar** — List meetings I had today and upcoming tomorrow (use Google Calendar with detailed=True to get attendee response status). Only include events where my responseStatus is "accepted" or "tentative" — exclude events I declined ("declined") or haven't responded to ("needsAction").
 4. **Key activities** — Any other notable work (emails sent, Slack threads, etc.)
 
 Format it as a clean summary I can quickly scan on my phone. Use markdown.
@@ -252,17 +257,17 @@ def strip_quoted_reply(text: str) -> str:
 
 
 def strip_claude_prefix(text: str) -> str:
-    """Remove the [claude] subject prefix if present (case-insensitive)."""
-    return re.sub(r"^\[claude\]\s*", "", text, flags=re.IGNORECASE)
+    """Remove the 'cc' subject prefix if present (case-insensitive)."""
+    return re.sub(r"^cc\b\s*", "", text, flags=re.IGNORECASE)
 
 
 def generate_subject(body: str, max_len: int = 50) -> str:
     """Generate a short subject line from the user's message."""
     first_line = body.split("\n")[0].strip()
-    first_line = re.sub(r'^\[claude\]\s*', '', first_line, flags=re.IGNORECASE)
+    first_line = re.sub(r'^cc\b\s*', '', first_line, flags=re.IGNORECASE)
     if len(first_line) > max_len:
         first_line = first_line[:max_len].rsplit(" ", 1)[0] + "..."
-    return f"[claude] {first_line}" if first_line else "[claude] conversation"
+    return f"cc {first_line}" if first_line else "cc conversation"
 
 
 def _extract_attachments(payload: dict) -> list[dict]:
@@ -522,7 +527,7 @@ def invoke_claude(
                 output = (
                     f"[Claude exited with code {proc.returncode}]\n\n"
                     + (f"Error: {stderr_text}\n\n" if stderr_text else "")
-                    + "Reply in this thread to retry, or start a new thread with [claude] prefix."
+                    + "Reply in this thread to retry, or start a new thread with cc prefix."
                 )
             if not output:
                 output = (
@@ -762,9 +767,11 @@ def send_work_summary(service, my_email: str):
 
     log.info("Generating daily work summary via Claude")
 
+    from datetime import timedelta
     prompt = SUMMARY_PROMPT.format(
         date=now.strftime("%Y-%m-%d (%A)"),
         today=now.strftime("%Y-%m-%d"),
+        yesterday=(now - timedelta(days=1)).strftime("%Y-%m-%d"),
         email=my_email,
     )
 
@@ -878,7 +885,7 @@ def _poll_cycle(
     _maybe_send_digest(service, my_email, thread_sessions, len(processed_ids))
     _maybe_send_summary(service, my_email)
 
-    query = f"subject:{SUBJECT_PREFIX} newer_than:1d"
+    query = f'subject:"{SUBJECT_PREFIX}" newer_than:1d is:unread'
     messages = search_messages(service, query)
 
     if not messages:
@@ -980,14 +987,22 @@ def _poll_cycle(
             continue
         if body.lower() == "/summary":
             log.info("Manual work summary requested")
+            from datetime import timedelta
+            _now = datetime.now()
             prompt = SUMMARY_PROMPT.format(
-                date=datetime.now().strftime("%Y-%m-%d (%A)"),
-                today=datetime.now().strftime("%Y-%m-%d"),
+                date=_now.strftime("%Y-%m-%d (%A)"),
+                today=_now.strftime("%Y-%m-%d"),
+                yesterday=(_now - timedelta(days=1)).strftime("%Y-%m-%d"),
                 email=my_email,
             )
             session_id = str(uuid.uuid4())
             response = invoke_claude(prompt, session_id, resume=False)
-            send_reply(service, msg, response, my_email)
+            summary_sent = send_reply(service, msg, response, my_email)
+            if summary_sent and "id" in summary_sent:
+                processed_ids.add(summary_sent["id"])
+                save_processed_id(summary_sent["id"])
+            # Mark summary as sent so the auto-summary at SUMMARY_HOUR skips
+            SUMMARY_LAST_SENT_FILE.write_text(_now.strftime("%Y-%m-%d"))
             mark_as_read(service, msg_id)
             processed_ids.add(msg_id)
             save_processed_id(msg_id)
@@ -1048,7 +1063,10 @@ def _poll_cycle(
         def on_progress(elapsed_secs):
             mins = elapsed_secs // 60
             try:
-                send_reply(service, msg, f"[Still working... ({mins}m elapsed)]", my_email)
+                progress_sent = send_reply(service, msg, f"[Still working... ({mins}m elapsed)]", my_email)
+                if progress_sent and "id" in progress_sent:
+                    processed_ids.add(progress_sent["id"])
+                    save_processed_id(progress_sent["id"])
                 log.info("Sent progress update at %ds for message %s", elapsed_secs, msg_id)
             except Exception:
                 log.exception("Failed to send progress email")
@@ -1061,7 +1079,10 @@ def _poll_cycle(
                 f"You've used {RATE_LIMIT_PER_HOUR} Claude invocations in the last hour.\n"
                 "Wait a bit and try again, or adjust RATE_LIMIT_PER_HOUR in bridge.py."
             )
-            send_reply(service, msg, response, my_email)
+            rate_sent = send_reply(service, msg, response, my_email)
+            if rate_sent and "id" in rate_sent:
+                processed_ids.add(rate_sent["id"])
+                save_processed_id(rate_sent["id"])
             mark_as_read(service, msg_id)
             processed_ids.add(msg_id)
             save_processed_id(msg_id)
@@ -1094,9 +1115,13 @@ def _poll_cycle(
         try:
             if not resume:
                 new_subject = generate_subject(body)
-                send_reply(service, msg, response, my_email, override_subject=f"Re: {new_subject}")
+                sent = send_reply(service, msg, response, my_email, override_subject=f"Re: {new_subject}")
             else:
-                send_reply(service, msg, response, my_email)
+                sent = send_reply(service, msg, response, my_email)
+            # Track sent reply ID so we never re-process our own replies
+            if sent and "id" in sent:
+                processed_ids.add(sent["id"])
+                save_processed_id(sent["id"])
             log.info("Replied to message %s (session=%s)", msg_id, session_id[:8])
         except Exception:
             log.exception("Failed to send reply for message %s", msg_id)
