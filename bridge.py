@@ -1136,72 +1136,14 @@ def _poll_cycle(
 # ---------------------------------------------------------------------------
 
 
-def _find_bridge_pids():
-    """Return PIDs of running bridge.py daemon processes (not ourselves).
-
-    Uses ``ps -eww -o pid,command`` (wide output) so that long command
-    lines are not truncated on macOS.  Only matches ``bridge.py start``
-    or ``bridge.py run`` to avoid hitting stop commands.
-    """
-    skip_pids = {os.getpid(), os.getppid()}
-    try:
-        out = subprocess.check_output(
-            ["ps", "-eww", "-o", "pid,command"], text=True,
-        )
-    except subprocess.CalledProcessError:
-        return []
-    pids = []
-    for line in out.splitlines()[1:]:  # skip header
-        line = line.strip()
-        if not line:
-            continue
-        if "bridge.py start" not in line and "bridge.py run" not in line:
-            continue
-        try:
-            pid = int(line.split()[0])
-        except (IndexError, ValueError):
-            continue
-        if pid in skip_pids:
-            continue
-        pids.append(pid)
-    return pids
-
-
-def _kill_pids(pids):
-    """Send SIGTERM to *pids*, wait up to 3 s, then SIGKILL survivors."""
-    for pid in pids:
-        try:
-            os.kill(pid, signal.SIGTERM)
-        except OSError:
-            pass
-    for _ in range(6):
-        if not any(_pid_alive(p) for p in pids):
-            return
-        time.sleep(0.5)
-    # SIGKILL anything still alive.
-    for pid in pids:
-        if _pid_alive(pid):
-            try:
-                os.kill(pid, signal.SIGKILL)
-            except OSError:
-                pass
-
-
-def _pid_alive(pid):
-    try:
-        os.kill(pid, 0)
-        return True
-    except OSError:
-        return False
-
-
 def start_daemon():
     """Start the bridge as a background process.
 
-    Uses fcntl.flock() to guarantee only one daemon runs at a time,
-    even if PID files become stale.
+    Uses fcntl.flock() on LOCK_FILE to guarantee at most one daemon runs.
+    The lock is acquired before forking and the fd is inherited by the
+    grandchild, so there is no race window where a second instance can
+    slip through.
     """
-    # Try to acquire the lock (non-blocking).
     LOCK_FILE.touch(exist_ok=True)
     lock_fd = open(LOCK_FILE, "r+")
     try:
@@ -1212,26 +1154,13 @@ def start_daemon():
         print(f"Bridge already running (PID {pid})")
         return
 
-    # Lock acquired — kill any orphaned bridge processes from before this
-    # fix was deployed (they won't hold the lock).
-    orphans = _find_bridge_pids()
-    if orphans:
-        print(f"Killing orphaned bridge process(es): {orphans}")
-        _kill_pids(orphans)
-
-    # Clean stale PID file.
+    # Lock acquired — clean stale PID file.
     if PID_FILE.exists():
         PID_FILE.unlink()
 
-    # Fork into background.
+    # Fork into background. Child inherits lock_fd.
     pid = os.fork()
     if pid > 0:
-        # Parent: wait until grandchild writes PID file (proving it
-        # acquired its own lock), then release ours and exit.
-        for _ in range(40):
-            time.sleep(0.25)
-            if PID_FILE.exists():
-                break
         lock_fd.close()
         print(f"Bridge started (PID {pid})")
         print(f"Logs: {LOG_FILE}")
@@ -1240,22 +1169,14 @@ def start_daemon():
     # Child: become session leader.
     os.setsid()
 
-    # Second fork to fully detach.  Grandchild inherits lock_fd.
-    pid2 = os.fork()
-    if pid2 > 0:
+    # Second fork to fully detach. Grandchild inherits lock_fd.
+    pid = os.fork()
+    if pid > 0:
         os._exit(0)
 
     # Grandchild — the actual daemon.
-    # Close inherited lock fd — its flock will be released when the
-    # parent exits (flock is per open-file-description, not per fd).
-    # Acquire our OWN independent flock instead.
-    lock_fd.close()
-    LOCK_FILE.touch(exist_ok=True)
-    daemon_lock = open(LOCK_FILE, "w")
-    try:
-        fcntl.flock(daemon_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except BlockingIOError:
-        os._exit(1)
+    # Keep lock_fd open: flock is per open-file-description, so the lock
+    # stays held as long as ANY fd referencing that description is open.
 
     # Redirect stdio.
     sys.stdin.close()
@@ -1270,20 +1191,33 @@ def start_daemon():
     finally:
         if PID_FILE.exists():
             PID_FILE.unlink()
-        daemon_lock.close()
+        lock_fd.close()
 
 
 def stop_daemon():
-    """Stop all running bridge daemon(s)."""
-    pids = _find_bridge_pids()
-    if pids:
-        print(f"Stopping bridge process(es): {pids}")
-        _kill_pids(pids)
+    """Stop the running bridge daemon."""
+    if not PID_FILE.exists():
+        print("Bridge is not running (no PID file)")
+        return
+
+    pid = int(PID_FILE.read_text().strip())
+    try:
+        os.kill(pid, signal.SIGTERM)
+        print(f"Sent SIGTERM to bridge (PID {pid})")
+        for _ in range(10):
+            try:
+                os.kill(pid, 0)
+                time.sleep(0.5)
+            except OSError:
+                break
         print("Bridge stopped")
-    else:
-        print("Bridge is not running")
-    if PID_FILE.exists():
-        PID_FILE.unlink()
+    except OSError:
+        print(f"Process {pid} not found (stale PID file)")
+    finally:
+        if PID_FILE.exists():
+            PID_FILE.unlink()
+
+
 
 
 # ---------------------------------------------------------------------------
