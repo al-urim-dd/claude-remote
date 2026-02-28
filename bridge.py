@@ -855,7 +855,9 @@ def run_bridge(foreground: bool = False):
 
     while running:
         try:
+            log.info("Starting poll cycle")
             _poll_cycle(service, my_email, processed_ids, thread_sessions, startup_time_ms)
+            log.info("Poll cycle complete")
         except Exception:
             log.exception("Error in poll cycle")
             # Re-authenticate in case token issues
@@ -901,14 +903,6 @@ def _poll_cycle(
 
         # Fetch full message
         msg = get_message(service, msg_id)
-
-        # Safety: ignore messages from before startup
-        if msg["internal_date_ms"] < startup_time_ms:
-            log.info("Skipping pre-startup message %s (date=%s)", msg_id, msg["date"])
-            mark_as_read(service, msg_id)
-            processed_ids.add(msg_id)
-            save_processed_id(msg_id)
-            continue
 
         # Sender check: only process emails from ourselves, skip our own replies
         sender_name, sender_email = email.utils.parseaddr(msg["from"])
