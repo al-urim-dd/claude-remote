@@ -1139,14 +1139,14 @@ def _poll_cycle(
 def _find_bridge_pids():
     """Return PIDs of running bridge.py daemon processes (not ourselves).
 
-    Uses ``ps -eo pid,command`` for clean two-column output where PID is
-    always the first field.  Only matches ``bridge.py start`` or
-    ``bridge.py run`` to avoid hitting stop commands.
+    Uses ``ps -eww -o pid,command`` (wide output) so that long command
+    lines are not truncated on macOS.  Only matches ``bridge.py start``
+    or ``bridge.py run`` to avoid hitting stop commands.
     """
     skip_pids = {os.getpid(), os.getppid()}
     try:
         out = subprocess.check_output(
-            ["ps", "-eo", "pid,command"], text=True,
+            ["ps", "-eww", "-o", "pid,command"], text=True,
         )
     except subprocess.CalledProcessError:
         return []
@@ -1212,7 +1212,13 @@ def start_daemon():
         print(f"Bridge already running (PID {pid})")
         return
 
-    # Lock acquired — no other daemon is running.
+    # Lock acquired — kill any orphaned bridge processes from before this
+    # fix was deployed (they won't hold the lock).
+    orphans = _find_bridge_pids()
+    if orphans:
+        print(f"Killing orphaned bridge process(es): {orphans}")
+        _kill_pids(orphans)
+
     # Clean stale PID file.
     if PID_FILE.exists():
         PID_FILE.unlink()
