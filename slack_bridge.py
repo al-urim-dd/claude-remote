@@ -10,6 +10,7 @@ Usage:
     ./slack_bridge.py run     # Run in foreground (for debugging)
 """
 
+import fcntl
 import json
 import logging
 import os
@@ -39,6 +40,7 @@ CLAUDE_CWD = "/Users/zhengli.sun/Projects"
 PROCESSED_FILE = CONFIG_DIR / "slack_processed.txt"
 SESSIONS_FILE = CONFIG_DIR / "slack_sessions.json"
 PID_FILE = CONFIG_DIR / "slack_bridge.pid"
+LOCK_FILE = CONFIG_DIR / "slack_bridge.lock"
 LOG_FILE = CONFIG_DIR / "slack_bridge.log"
 RATE_LIMIT_PER_HOUR = 20
 RATE_LIMIT_FILE = CONFIG_DIR / "slack_rate_limit.json"
@@ -750,39 +752,87 @@ def _poll_cycle(
 # ---------------------------------------------------------------------------
 
 
-def start_daemon():
-    """Start the bridge as a background process."""
-    if PID_FILE.exists():
-        pid = int(PID_FILE.read_text().strip())
+def _find_bridge_pids():
+    """Return PIDs of all running slack_bridge.py processes except ourselves."""
+    skip_pids = {os.getpid(), os.getppid()}
+    try:
+        out = subprocess.check_output(["ps", "aux"], text=True)
+    except subprocess.CalledProcessError:
+        return []
+    pids = []
+    for line in out.splitlines():
+        if "slack_bridge.py" not in line:
+            continue
+        parts = line.split()
         try:
-            os.kill(pid, 0)  # Check if process exists
-            print(f"Slack bridge already running (PID {pid})")
-            return
-        except OSError:
-            PID_FILE.unlink()  # Stale PID file
+            pid = int(parts[1])
+        except (IndexError, ValueError):
+            continue
+        if pid in skip_pids:
+            continue
+        pids.append(pid)
+    return pids
 
-    # Fork into background
+
+def start_daemon():
+    """Start the bridge as a background process.
+
+    Uses fcntl.flock() to guarantee only one daemon runs at a time.
+    The lock is acquired before forking and inherited by the child,
+    so there is no window where a second invocation can slip through.
+    """
+    LOCK_FILE.touch(exist_ok=True)
+    lock_fd = open(LOCK_FILE, "r+")
+    try:
+        fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        lock_fd.close()
+        pid = "(unknown)"
+        if PID_FILE.exists():
+            pid = PID_FILE.read_text().strip()
+        print(f"Slack bridge already running (PID {pid})")
+        return
+
+    # Lock acquired — kill any orphaned processes from a bad shutdown.
+    orphans = _find_bridge_pids()
+    if orphans:
+        for p in orphans:
+            try:
+                os.kill(p, signal.SIGTERM)
+            except OSError:
+                pass
+        print(f"Killed orphaned bridge process(es): {orphans}")
+        time.sleep(0.5)
+
+    if PID_FILE.exists():
+        PID_FILE.unlink()
+
+    # Fork into background. Child inherits lock_fd.
     pid = os.fork()
     if pid > 0:
-        # Parent
+        # Parent — lock_fd stays open until process exits, but the child
+        # shares the same open-file-description so the lock persists.
         print(f"Slack bridge started (PID {pid})")
         print(f"Logs: {LOG_FILE}")
         return
 
-    # Child: become session leader
+    # Child: become session leader.
     os.setsid()
 
-    # Second fork to fully detach
+    # Second fork to fully detach. Grandchild inherits lock_fd.
     pid = os.fork()
     if pid > 0:
         os._exit(0)
 
-    # Redirect stdio
+    # Grandchild (daemon) — keep lock_fd alive for the process lifetime.
+    _lock_fd = lock_fd  # noqa: F841
+
+    # Redirect stdio.
     sys.stdin.close()
     sys.stdout = open(os.devnull, "w")
     sys.stderr = open(os.devnull, "w")
 
-    # Write PID file
+    # Write PID file.
     PID_FILE.write_text(str(os.getpid()))
 
     try:
@@ -790,31 +840,41 @@ def start_daemon():
     finally:
         if PID_FILE.exists():
             PID_FILE.unlink()
+        _lock_fd.close()
 
 
 def stop_daemon():
-    """Stop the running bridge daemon."""
-    if not PID_FILE.exists():
-        print("Slack bridge is not running (no PID file)")
-        return
-
-    pid = int(PID_FILE.read_text().strip())
-    try:
-        os.kill(pid, signal.SIGTERM)
-        print(f"Sent SIGTERM to Slack bridge (PID {pid})")
-        # Wait briefly for clean shutdown
-        for _ in range(10):
+    """Stop all running bridge daemon(s)."""
+    pids = _find_bridge_pids()
+    if pids:
+        for p in pids:
             try:
-                os.kill(pid, 0)
-                time.sleep(0.5)
+                os.kill(p, signal.SIGTERM)
             except OSError:
+                pass
+        print(f"Sent SIGTERM to Slack bridge (PIDs {pids})")
+        for _ in range(10):
+            alive = any(
+                _safe_kill_check(p) for p in pids
+            )
+            if not alive:
                 break
+            time.sleep(0.5)
         print("Slack bridge stopped")
+    else:
+        print("Slack bridge is not running")
+
+    if PID_FILE.exists():
+        PID_FILE.unlink()
+
+
+def _safe_kill_check(pid):
+    """Return True if process is still alive."""
+    try:
+        os.kill(pid, 0)
+        return True
     except OSError:
-        print(f"Process {pid} not found (stale PID file)")
-    finally:
-        if PID_FILE.exists():
-            PID_FILE.unlink()
+        return False
 
 
 # ---------------------------------------------------------------------------

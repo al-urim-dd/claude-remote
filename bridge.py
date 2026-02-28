@@ -12,6 +12,7 @@ Usage:
 
 import base64
 import email.utils
+import fcntl
 import json
 import logging
 import os
@@ -42,6 +43,7 @@ TOKEN_FILE = CONFIG_DIR / "token.json"
 PROCESSED_FILE = CONFIG_DIR / "processed.txt"
 SESSIONS_FILE = CONFIG_DIR / "thread_sessions.json"
 PID_FILE = CONFIG_DIR / "bridge.pid"
+LOCK_FILE = CONFIG_DIR / "bridge.lock"
 LOG_FILE = CONFIG_DIR / "bridge.log"
 
 SCOPES = [
@@ -1134,39 +1136,110 @@ def _poll_cycle(
 # ---------------------------------------------------------------------------
 
 
-def start_daemon():
-    """Start the bridge as a background process."""
-    if PID_FILE.exists():
-        pid = int(PID_FILE.read_text().strip())
-        try:
-            os.kill(pid, 0)  # Check if process exists
-            print(f"Bridge already running (PID {pid})")
-            return
-        except OSError:
-            PID_FILE.unlink()  # Stale PID file
+def _find_bridge_pids():
+    """Return PIDs of running bridge.py daemon processes (not ourselves).
 
-    # Fork into background
+    Uses ``ps -eo pid,command`` for clean two-column output where PID is
+    always the first field.  Only matches ``bridge.py start`` or
+    ``bridge.py run`` to avoid hitting stop commands.
+    """
+    skip_pids = {os.getpid(), os.getppid()}
+    try:
+        out = subprocess.check_output(
+            ["ps", "-eo", "pid,command"], text=True,
+        )
+    except subprocess.CalledProcessError:
+        return []
+    pids = []
+    for line in out.splitlines()[1:]:  # skip header
+        line = line.strip()
+        if not line:
+            continue
+        if "bridge.py start" not in line and "bridge.py run" not in line:
+            continue
+        try:
+            pid = int(line.split()[0])
+        except (IndexError, ValueError):
+            continue
+        if pid in skip_pids:
+            continue
+        pids.append(pid)
+    return pids
+
+
+def _kill_pids(pids):
+    """Send SIGTERM to *pids* and wait up to 5 s for them to exit."""
+    for pid in pids:
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except OSError:
+            pass
+    for _ in range(10):
+        alive = [p for p in pids if _pid_alive(p)]
+        if not alive:
+            return
+        time.sleep(0.5)
+
+
+def _pid_alive(pid):
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
+
+
+def start_daemon():
+    """Start the bridge as a background process.
+
+    Uses fcntl.flock() to guarantee only one daemon runs at a time,
+    even if PID files become stale.
+    """
+    # Try to acquire the lock (non-blocking).
+    LOCK_FILE.touch(exist_ok=True)
+    lock_fd = open(LOCK_FILE, "r+")
+    try:
+        fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        lock_fd.close()
+        pid = PID_FILE.read_text().strip() if PID_FILE.exists() else "unknown"
+        print(f"Bridge already running (PID {pid})")
+        return
+
+    # Lock acquired — kill any orphaned bridge processes.
+    orphans = _find_bridge_pids()
+    if orphans:
+        print(f"Killing orphaned bridge process(es): {orphans}")
+        _kill_pids(orphans)
+
+    # Clean stale PID file.
+    if PID_FILE.exists():
+        PID_FILE.unlink()
+
+    # Fork into background.  Child inherits lock_fd.
     pid = os.fork()
     if pid > 0:
-        # Parent
+        # Parent — lock_fd closes when parent exits, but child still
+        # holds a reference to the same open-file-description.
         print(f"Bridge started (PID {pid})")
         print(f"Logs: {LOG_FILE}")
         return
 
-    # Child: become session leader
+    # Child: become session leader.
     os.setsid()
 
-    # Second fork to fully detach
-    pid = os.fork()
-    if pid > 0:
+    # Second fork to fully detach.  Grandchild inherits lock_fd.
+    pid2 = os.fork()
+    if pid2 > 0:
         os._exit(0)
 
-    # Redirect stdio
+    # Grandchild — the actual daemon.
+    # Redirect stdio.
     sys.stdin.close()
     sys.stdout = open(os.devnull, "w")
     sys.stderr = open(os.devnull, "w")
 
-    # Write PID file
+    # Write PID file.
     PID_FILE.write_text(str(os.getpid()))
 
     try:
@@ -1174,31 +1247,20 @@ def start_daemon():
     finally:
         if PID_FILE.exists():
             PID_FILE.unlink()
+        lock_fd.close()
 
 
 def stop_daemon():
-    """Stop the running bridge daemon."""
-    if not PID_FILE.exists():
-        print("Bridge is not running (no PID file)")
-        return
-
-    pid = int(PID_FILE.read_text().strip())
-    try:
-        os.kill(pid, signal.SIGTERM)
-        print(f"Sent SIGTERM to bridge (PID {pid})")
-        # Wait briefly for clean shutdown
-        for _ in range(10):
-            try:
-                os.kill(pid, 0)
-                time.sleep(0.5)
-            except OSError:
-                break
+    """Stop all running bridge daemon(s)."""
+    pids = _find_bridge_pids()
+    if pids:
+        print(f"Stopping bridge process(es): {pids}")
+        _kill_pids(pids)
         print("Bridge stopped")
-    except OSError:
-        print(f"Process {pid} not found (stale PID file)")
-    finally:
-        if PID_FILE.exists():
-            PID_FILE.unlink()
+    else:
+        print("Bridge is not running")
+    if PID_FILE.exists():
+        PID_FILE.unlink()
 
 
 # ---------------------------------------------------------------------------
