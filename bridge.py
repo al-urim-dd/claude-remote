@@ -885,7 +885,7 @@ def _poll_cycle(
     _maybe_send_digest(service, my_email, thread_sessions, len(processed_ids))
     _maybe_send_summary(service, my_email)
 
-    query = f"subject:{SUBJECT_PREFIX} newer_than:1d"
+    query = f'subject:"{SUBJECT_PREFIX}" newer_than:1d is:unread'
     messages = search_messages(service, query)
 
     if not messages:
@@ -997,7 +997,12 @@ def _poll_cycle(
             )
             session_id = str(uuid.uuid4())
             response = invoke_claude(prompt, session_id, resume=False)
-            send_reply(service, msg, response, my_email)
+            summary_sent = send_reply(service, msg, response, my_email)
+            if summary_sent and "id" in summary_sent:
+                processed_ids.add(summary_sent["id"])
+                save_processed_id(summary_sent["id"])
+            # Mark summary as sent so the auto-summary at SUMMARY_HOUR skips
+            SUMMARY_LAST_SENT_FILE.write_text(_now.strftime("%Y-%m-%d"))
             mark_as_read(service, msg_id)
             processed_ids.add(msg_id)
             save_processed_id(msg_id)
@@ -1058,7 +1063,10 @@ def _poll_cycle(
         def on_progress(elapsed_secs):
             mins = elapsed_secs // 60
             try:
-                send_reply(service, msg, f"[Still working... ({mins}m elapsed)]", my_email)
+                progress_sent = send_reply(service, msg, f"[Still working... ({mins}m elapsed)]", my_email)
+                if progress_sent and "id" in progress_sent:
+                    processed_ids.add(progress_sent["id"])
+                    save_processed_id(progress_sent["id"])
                 log.info("Sent progress update at %ds for message %s", elapsed_secs, msg_id)
             except Exception:
                 log.exception("Failed to send progress email")
@@ -1071,7 +1079,10 @@ def _poll_cycle(
                 f"You've used {RATE_LIMIT_PER_HOUR} Claude invocations in the last hour.\n"
                 "Wait a bit and try again, or adjust RATE_LIMIT_PER_HOUR in bridge.py."
             )
-            send_reply(service, msg, response, my_email)
+            rate_sent = send_reply(service, msg, response, my_email)
+            if rate_sent and "id" in rate_sent:
+                processed_ids.add(rate_sent["id"])
+                save_processed_id(rate_sent["id"])
             mark_as_read(service, msg_id)
             processed_ids.add(msg_id)
             save_processed_id(msg_id)
@@ -1104,9 +1115,13 @@ def _poll_cycle(
         try:
             if not resume:
                 new_subject = generate_subject(body)
-                send_reply(service, msg, response, my_email, override_subject=f"Re: {new_subject}")
+                sent = send_reply(service, msg, response, my_email, override_subject=f"Re: {new_subject}")
             else:
-                send_reply(service, msg, response, my_email)
+                sent = send_reply(service, msg, response, my_email)
+            # Track sent reply ID so we never re-process our own replies
+            if sent and "id" in sent:
+                processed_ids.add(sent["id"])
+                save_processed_id(sent["id"])
             log.info("Replied to message %s (session=%s)", msg_id, session_id[:8])
         except Exception:
             log.exception("Failed to send reply for message %s", msg_id)
