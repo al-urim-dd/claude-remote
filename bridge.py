@@ -1,7 +1,7 @@
 #!/Users/zhengli.sun/Projects/claude-remote/.venv/bin/python
 """ClaudeRemote: Gmail remote interface for Claude Code.
 
-Polls Gmail for emails with [claude] subject prefix, feeds them to Claude Code
+Polls Gmail for emails with "cc" subject prefix, feeds them to Claude Code
 via subprocess, and replies in the same email thread.
 
 Usage:
@@ -53,7 +53,7 @@ POLL_INTERVAL = 30  # seconds
 CLAUDE_TIMEOUT = 600  # 10 minutes
 MAX_RESPONSE_LEN = 50_000  # chars
 CLAUDE_CWD = "/Users/zhengli.sun/Projects"
-SUBJECT_PREFIX = "[claude]"
+SUBJECT_PREFIX = "cc"
 REPLY_SENDER_NAME = "ClaudeRemote"  # Display name on reply emails
 ATTACHMENTS_DIR = CONFIG_DIR / "attachments"
 MAX_ATTACHMENT_SIZE = 10 * 1024 * 1024  # 10 MB
@@ -257,17 +257,17 @@ def strip_quoted_reply(text: str) -> str:
 
 
 def strip_claude_prefix(text: str) -> str:
-    """Remove the [claude] subject prefix if present (case-insensitive)."""
-    return re.sub(r"^\[claude\]\s*", "", text, flags=re.IGNORECASE)
+    """Remove the 'cc' subject prefix if present (case-insensitive)."""
+    return re.sub(r"^cc\b\s*", "", text, flags=re.IGNORECASE)
 
 
 def generate_subject(body: str, max_len: int = 50) -> str:
     """Generate a short subject line from the user's message."""
     first_line = body.split("\n")[0].strip()
-    first_line = re.sub(r'^\[claude\]\s*', '', first_line, flags=re.IGNORECASE)
+    first_line = re.sub(r'^cc\b\s*', '', first_line, flags=re.IGNORECASE)
     if len(first_line) > max_len:
         first_line = first_line[:max_len].rsplit(" ", 1)[0] + "..."
-    return f"[claude] {first_line}" if first_line else "[claude] conversation"
+    return f"cc {first_line}" if first_line else "cc conversation"
 
 
 def _extract_attachments(payload: dict) -> list[dict]:
@@ -527,7 +527,7 @@ def invoke_claude(
                 output = (
                     f"[Claude exited with code {proc.returncode}]\n\n"
                     + (f"Error: {stderr_text}\n\n" if stderr_text else "")
-                    + "Reply in this thread to retry, or start a new thread with [claude] prefix."
+                    + "Reply in this thread to retry, or start a new thread with cc prefix."
                 )
             if not output:
                 output = (

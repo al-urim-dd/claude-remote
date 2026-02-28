@@ -63,7 +63,7 @@ tail -f ~/.claude-remote/bridge.log
 Send an email **to yourself** with the subject:
 
 ```
-[claude] your question here
+cc your question here
 ```
 
 The bridge picks it up within ~30 seconds and replies in the same thread. Reply in the thread to continue the conversation (Claude retains context via sessions).
@@ -91,7 +91,7 @@ The bridge picks it up within ~30 seconds and replies in the same thread. Reply 
 ### Email Quality
 - **Rich HTML formatting** -- replies with code blocks, tables, and headings render as styled HTML in Gmail
 - **Quoted reply stripping** -- strips Gmail/Outlook quoted reply text so Claude only sees your new message
-- **`[claude]` prefix stripping** -- removes the prefix before sending to Claude so it gets a clean prompt
+- **`cc` prefix stripping** -- removes the prefix before sending to Claude so it gets a clean prompt
 - **Distinct sender** -- bridge replies show as "ClaudeRemote" so you can tell them apart
 
 ### Reliability
@@ -161,7 +161,7 @@ Edit the constants at the top of `bridge.py`:
 | `CLAUDE_TIMEOUT` | `600` | Max seconds per Claude invocation |
 | `MAX_RESPONSE_LEN` | `50000` | Truncate replies beyond this length |
 | `CLAUDE_CWD` | `~/Projects` | Working directory for Claude |
-| `SUBJECT_PREFIX` | `[claude]` | Email subject prefix to watch for |
+| `SUBJECT_PREFIX` | `cc` | Email subject prefix to watch for |
 | `REPLY_SENDER_NAME` | `ClaudeRemote` | Display name on reply emails |
 | `MAX_ATTACHMENT_SIZE` | `10MB` | Skip attachments larger than this |
 | `PROGRESS_INTERVAL` | `120` | Seconds between "still working" progress emails |
@@ -172,7 +172,7 @@ Edit the constants at the top of `bridge.py`:
 ## Security
 
 - **Sender check**: only processes emails from your own address
-- **Subject gate**: only emails with `[claude]` prefix
+- **Subject gate**: only emails with `cc` prefix
 - **Rate limiting**: 20 invocations/hour cap prevents runaway costs
 - **Startup safety**: ignores all existing emails on daemon start
 - **Local only**: all processing on your laptop, Gmail API over HTTPS
