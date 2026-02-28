@@ -1136,6 +1136,36 @@ def _poll_cycle(
 # ---------------------------------------------------------------------------
 
 
+def _pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
+
+
+def _find_bridge_pids():
+    """Return PIDs of running bridge.py daemon processes (not ourselves)."""
+    skip_pids = {os.getpid(), os.getppid()}
+    try:
+        out = subprocess.check_output(["ps", "aux"], text=True)
+    except subprocess.CalledProcessError:
+        return []
+    pids = []
+    for line in out.splitlines():
+        if "bridge.py" not in line or "slack_bridge" in line:
+            continue
+        parts = line.split()
+        try:
+            pid = int(parts[1])
+        except (IndexError, ValueError):
+            continue
+        if pid in skip_pids:
+            continue
+        pids.append(pid)
+    return pids
+
+
 def start_daemon():
     """Start the bridge as a background process.
 
@@ -1195,27 +1225,49 @@ def start_daemon():
 
 
 def stop_daemon():
-    """Stop the running bridge daemon."""
-    if not PID_FILE.exists():
-        print("Bridge is not running (no PID file)")
-        return
+    """Stop all running bridge daemon(s).
 
-    pid = int(PID_FILE.read_text().strip())
-    try:
-        os.kill(pid, signal.SIGTERM)
-        print(f"Sent SIGTERM to bridge (PID {pid})")
-        for _ in range(10):
-            try:
-                os.kill(pid, 0)
-                time.sleep(0.5)
-            except OSError:
-                break
-        print("Bridge stopped")
-    except OSError:
-        print(f"Process {pid} not found (stale PID file)")
-    finally:
+    Uses both PID file and pgrep to find processes, ensuring orphans
+    are killed too. Falls back to SIGKILL if SIGTERM doesn't work.
+    """
+    pids = set(_find_bridge_pids())
+    if PID_FILE.exists():
+        try:
+            file_pid = int(PID_FILE.read_text().strip())
+            if _pid_alive(file_pid):
+                pids.add(file_pid)
+        except (ValueError, OSError):
+            pass
+    pids = list(pids)
+
+    if not pids:
+        print("Bridge is not running")
         if PID_FILE.exists():
             PID_FILE.unlink()
+        return
+
+    for pid in pids:
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except OSError:
+            pass
+    print(f"Sent SIGTERM to bridge process(es): {pids}")
+
+    for _ in range(10):
+        if not any(_pid_alive(p) for p in pids):
+            break
+        time.sleep(0.5)
+
+    for pid in pids:
+        if _pid_alive(pid):
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except OSError:
+                pass
+
+    print("Bridge stopped")
+    if PID_FILE.exists():
+        PID_FILE.unlink()
 
 
 
