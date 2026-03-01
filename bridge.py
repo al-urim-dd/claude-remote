@@ -81,6 +81,37 @@ DIGEST_ENABLED = True
 DIGEST_HOUR = 8  # Send digest at 8am local time
 DIGEST_LAST_SENT_FILE = CONFIG_DIR / "digest_last_sent.txt"
 
+JOURNAL_FILE = Path.home() / "Projects" / "notes" / "journal" / "2026.md"
+
+DIGEST_PROMPT = """\
+Generate a concise morning briefing email for today. Read these inputs and synthesize:
+
+1. **Journal TODOs** — Here is my work journal. Extract ALL unchecked TODOs ([ ]) from the current week and the "Open" section at the top. Group by project. Ignore completed ([x]) items.
+
+```markdown
+{journal}
+```
+
+2. **PRs needing my review** — Here is a list of open PRs requesting my review:
+{pending_prs}
+
+3. **Today's calendar** — Check my Google Calendar for today's meetings (use get_events with detailed=True). Only include events where my responseStatus is "accepted" or "tentative".
+
+Format the briefing as:
+
+**Today's Focus** (top 3 priorities from the TODOs)
+
+**Open TODOs** (grouped by project, with unchecked items only)
+
+**PRs to Review** (list with PR number, title, author)
+
+**Today's Meetings** (time and title, chronological)
+
+Keep it scannable on a phone. Use markdown.
+Today's date: {date}
+Today (YYYY-MM-DD): {today}
+My email: {email}"""
+
 CANCEL_FILE = CONFIG_DIR / "cancel.txt"
 
 RATE_LIMIT_PER_HOUR = 20  # Max Claude invocations per hour
@@ -90,23 +121,38 @@ SUMMARY_ENABLED = True
 SUMMARY_HOUR = 16  # Send work summary at 4pm local time
 SUMMARY_LAST_SENT_FILE = CONFIG_DIR / "summary_last_sent.txt"
 SUMMARY_PROMPT = """\
-Generate a concise end-of-day work summary for today. Include:
+Generate a concise end-of-day work summary for today. Compare what I planned vs what I actually did.
+
+Here is my work journal with today's planned TODOs:
+
+```markdown
+{journal}
+```
+
+Now gather what I actually did today:
 
 1. **PRs** — Use `gh` CLI to find PRs I worked on today. Run ALL of these commands:
    - PRs I authored: `gh search prs --author=@me --updated=">={yesterday}" --json number,title,repository,url,state`
    - PRs I reviewed: `gh search prs --reviewed-by=@me --updated=">={yesterday}" --json number,title,repository,url,author`
-   - PRs requesting my review: `gh search prs --review-requested=@me --state=open --json number,title,repository,url,author`
-   Combine and deduplicate the results. Label each as (authored/reviewed/needs review).
+   Combine and deduplicate the results. Label each as (authored/reviewed).
 2. **Documents I edited today** — Use Glean search (NOT Google Drive API) to find docs I actually edited.
-   Use the `search` tool with query="*", from="me", updated="today", and type="spreadsheet" for sheets or leave type empty for all docs.
-   Glean's `from` filter tracks actual editing activity, not just access permissions.
-   If Glean returns no results, fall back to `search_drive_files` with query="modifiedTime>'{today}T00:00:00' and 'me' in owners and trashed=false".
-   Only include documents where I made actual changes. Skip auto-generated or system files.
-3. **Calendar** — List meetings I had today and upcoming tomorrow (use Google Calendar with detailed=True to get attendee response status). Only include events where my responseStatus is "accepted" or "tentative" — exclude events I declined ("declined") or haven't responded to ("needsAction").
-4. **Key activities** — Any other notable work (emails sent, Slack threads, etc.)
+   Use the `search` tool with query="*", from="me", updated="today".
+   Only include documents where I made actual changes.
+3. **Calendar** — List meetings I had today (use Google Calendar with detailed=True). Only include events where my responseStatus is "accepted" or "tentative".
 
-Format it as a clean summary I can quickly scan on my phone. Use markdown.
-Keep it brief — highlight what matters, skip the noise.
+Format the summary as:
+
+**Completed Today** (TODOs from journal that are now done, plus work not in the journal)
+
+**Still Open** (unchecked TODOs from the current week that remain)
+
+**PRs** (authored/reviewed today)
+
+**Docs Edited** (from Glean)
+
+**Meetings Attended** (from calendar)
+
+Keep it scannable on a phone. Use markdown.
 Today's date: {date}
 Today (YYYY-MM-DD): {today}
 My email: {email}"""
@@ -691,7 +737,7 @@ def get_pending_reviews() -> list[dict]:
 
 
 def send_daily_digest(service, my_email: str, thread_sessions: dict, processed_count: int):
-    """Send a daily summary email with bridge stats and pending PRs."""
+    """Send a morning briefing by invoking Claude with journal + PRs + calendar."""
     now = datetime.now()
 
     # Check if we already sent today
@@ -700,46 +746,56 @@ def send_daily_digest(service, my_email: str, thread_sessions: dict, processed_c
         if last_sent == now.strftime("%Y-%m-%d"):
             return
 
-    active_threads = len(thread_sessions)
+    log.info("Generating morning briefing via Claude")
 
-    body = (
-        f"ClaudeRemote Daily Digest -- {now.strftime('%A, %B %d')}\n"
-        f"{'=' * 40}\n\n"
-        f"Messages processed today: {processed_count}\n"
-        f"Active thread sessions: {active_threads}\n"
-        f"Daemon PID: {os.getpid()}\n"
-        f"Uptime: since {_startup_time.strftime('%Y-%m-%d %H:%M') if _startup_time else 'unknown'}\n\n"
-    )
+    # Read journal (first 150 lines covers current + last week)
+    journal_text = ""
+    if JOURNAL_FILE.exists():
+        lines = JOURNAL_FILE.read_text().splitlines()
+        journal_text = "\n".join(lines[:150])
+    else:
+        journal_text = "(Journal file not found)"
 
-    # PRs awaiting review
+    # Get pending PRs
     pending_prs = get_pending_reviews()
     if pending_prs:
-        body += f"PRs Awaiting Your Review ({len(pending_prs)})\n"
-        body += "-" * 30 + "\n"
-        for pr in pending_prs:
-            body += f"  #{pr['number']} {pr['title']}\n"
-            body += f"    {pr['repo']} by {pr['author']}\n"
-            body += f"    {pr['url']}\n\n"
+        prs_text = "\n".join(
+            f"  - #{pr['number']} {pr['title']} ({pr['repo']} by {pr['author']}) {pr['url']}"
+            for pr in pending_prs
+        )
     else:
-        body += "No PRs awaiting your review.\n\n"
+        prs_text = "  (none)"
 
-    body += (
-        "Commands:\n"
-        "  /sessions -- list recent sessions\n"
-        "  /help -- show all commands\n"
-        "  /status -- check bridge health\n"
+    from datetime import timedelta
+    prompt = DIGEST_PROMPT.format(
+        journal=journal_text,
+        pending_prs=prs_text,
+        date=now.strftime("%Y-%m-%d (%A)"),
+        today=now.strftime("%Y-%m-%d"),
+        email=my_email,
     )
 
-    message = MIMEText(body)
-    message["from"] = f"ClaudeRemote <{my_email}>"
-    message["to"] = my_email
-    message["subject"] = f"[ClaudeRemote] Daily Digest -- {now.strftime('%b %d')}"
+    session_id = str(uuid.uuid4())
+    body = invoke_claude(prompt, session_id, resume=False)
 
-    raw = base64.urlsafe_b64encode(message.as_bytes()).decode("ascii")
+    if not body or body.startswith("["):
+        log.warning("Morning briefing generation failed: %s", body[:100] if body else "empty")
+        return
+
+    # Send as HTML
+    html = format_html_reply(body)
+    msg_mime = MIMEMultipart("alternative")
+    msg_mime.attach(MIMEText(body, "plain"))
+    msg_mime.attach(MIMEText(html, "html"))
+    msg_mime["from"] = f"ClaudeRemote <{my_email}>"
+    msg_mime["to"] = my_email
+    msg_mime["subject"] = f"[ClaudeRemote] Morning Briefing -- {now.strftime('%b %d')}"
+
+    raw = base64.urlsafe_b64encode(msg_mime.as_bytes()).decode("ascii")
     service.users().messages().send(userId="me", body={"raw": raw}).execute()
 
     DIGEST_LAST_SENT_FILE.write_text(now.strftime("%Y-%m-%d"))
-    log.info("Sent daily digest (%d pending PRs)", len(pending_prs))
+    log.info("Sent morning briefing")
 
 
 def _maybe_send_digest(service, my_email, thread_sessions, processed_count):
@@ -769,8 +825,17 @@ def send_work_summary(service, my_email: str):
 
     log.info("Generating daily work summary via Claude")
 
+    # Read journal for planned vs actual comparison
+    journal_text = ""
+    if JOURNAL_FILE.exists():
+        lines = JOURNAL_FILE.read_text().splitlines()
+        journal_text = "\n".join(lines[:150])
+    else:
+        journal_text = "(Journal file not found)"
+
     from datetime import timedelta
     prompt = SUMMARY_PROMPT.format(
+        journal=journal_text,
         date=now.strftime("%Y-%m-%d (%A)"),
         today=now.strftime("%Y-%m-%d"),
         yesterday=(now - timedelta(days=1)).strftime("%Y-%m-%d"),
@@ -983,9 +1048,14 @@ def _poll_cycle(
             continue
         if body.lower() == "/summary":
             log.info("Manual work summary requested")
+            journal_text = ""
+            if JOURNAL_FILE.exists():
+                jlines = JOURNAL_FILE.read_text().splitlines()
+                journal_text = "\n".join(jlines[:150])
             from datetime import timedelta
             _now = datetime.now()
             prompt = SUMMARY_PROMPT.format(
+                journal=journal_text or "(no journal found)",
                 date=_now.strftime("%Y-%m-%d (%A)"),
                 today=_now.strftime("%Y-%m-%d"),
                 yesterday=(_now - timedelta(days=1)).strftime("%Y-%m-%d"),
