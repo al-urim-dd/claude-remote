@@ -1,4 +1,4 @@
-#!/Users/zhengli.sun/Projects/claude-remote/.venv/bin/python
+#!/usr/bin/env python3
 """ClaudeRemote Slack Bridge: Slack remote interface for Claude Code.
 
 Polls a Slack channel for messages mentioning the bot, feeds them to Claude Code
@@ -36,7 +36,7 @@ SLACK_BOT_USER_ID = ""  # Set on startup by calling auth.test
 POLL_INTERVAL = 5  # seconds (Slack is faster than email)
 CLAUDE_TIMEOUT = 600  # 10 minutes
 MAX_RESPONSE_LEN = 50_000  # chars
-CLAUDE_CWD = "/Users/zhengli.sun/Projects"
+CLAUDE_CWD = str(Path.home() / "Projects")
 PROCESSED_FILE = CONFIG_DIR / "slack_processed.txt"
 SESSIONS_FILE = CONFIG_DIR / "slack_sessions.json"
 PID_FILE = CONFIG_DIR / "slack_bridge.pid"

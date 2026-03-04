@@ -1,4 +1,4 @@
-#!/Users/zhengli.sun/Projects/claude-remote/.venv/bin/python
+#!/usr/bin/env python3
 """Unit tests for ClaudeRemote bridge."""
 
 import base64
@@ -53,8 +53,8 @@ class TestStripQuotedReply:
     def test_gmail_quoted_reply(self):
         text = (
             "/sessions\n\n\n"
-            "On Thu, Feb 26, 2026 at 2:34 PM Zhengli Sun "
-            "<zhengli.sun@doordash.com> wrote:\n"
+            "On Thu, Feb 26, 2026 at 2:34 PM Test User "
+            "<user@example.com> wrote:\n"
             "> old stuff here"
         )
         assert bridge.strip_quoted_reply(text) == "/sessions"
@@ -103,21 +103,21 @@ class TestSelfReplyDetection:
 
     def test_skip_own_reply(self):
         sender_name, _ = email.utils.parseaddr(
-            f"{bridge.REPLY_SENDER_NAME} <zhengli.sun@doordash.com>"
+            f"{bridge.REPLY_SENDER_NAME} <user@example.com>"
         )
         assert sender_name == bridge.REPLY_SENDER_NAME
 
     def test_accept_user_email(self):
         sender_name, sender_email = email.utils.parseaddr(
-            "Zhengli Sun <zhengli.sun@doordash.com>"
+            "Test User <user@example.com>"
         )
         assert sender_name != bridge.REPLY_SENDER_NAME
-        assert sender_email == "zhengli.sun@doordash.com"
+        assert sender_email == "user@example.com"
 
     def test_accept_plain_email(self):
         """No display name — should not be treated as bot."""
         sender_name, sender_email = email.utils.parseaddr(
-            "zhengli.sun@doordash.com"
+            "user@example.com"
         )
         assert sender_name != bridge.REPLY_SENDER_NAME
 
@@ -138,7 +138,7 @@ class TestCommandParsing:
         raw = (
             "/sessions\n\n\n"
             "On Thu, Feb 26, 2026 at 3:01 PM ClaudeRemote "
-            "<zhengli.sun@doordash.com> wrote:\n"
+            "<user@example.com> wrote:\n"
             "> previous reply..."
         )
         body = bridge.strip_quoted_reply(raw)
@@ -148,7 +148,7 @@ class TestCommandParsing:
         raw = (
             "/resume abc-123-def\n\n"
             "On Thu, Feb 26, 2026 at 3:01 PM ClaudeRemote "
-            "<zhengli.sun@doordash.com> wrote:\n"
+            "<user@example.com> wrote:\n"
             "> previous reply..."
         )
         body = bridge.strip_quoted_reply(raw)
@@ -241,14 +241,14 @@ class TestStateManagement:
 
 class TestBuildThreadContext:
     def test_single_user_message(self):
-        msgs = [{"from_name": "Zhengli Sun", "date": "Feb 26", "body": "hello"}]
+        msgs = [{"from_name": "Test User", "date": "Feb 26", "body": "hello"}]
         ctx = bridge.build_thread_context(msgs)
         assert "[User -- Feb 26]" in ctx
         assert "hello" in ctx
 
     def test_bot_reply_labeled(self):
         msgs = [
-            {"from_name": "Zhengli Sun", "date": "Feb 26", "body": "question"},
+            {"from_name": "Test User", "date": "Feb 26", "body": "question"},
             {"from_name": bridge.REPLY_SENDER_NAME, "date": "Feb 26", "body": "answer"},
         ]
         ctx = bridge.build_thread_context(msgs)
@@ -289,12 +289,12 @@ class TestSendReplyFromName:
         """Verify the MIME message has ClaudeRemote as display name."""
         original_msg = {
             "subject": "cc test",
-            "from": "Zhengli Sun <zhengli.sun@doordash.com>",
+            "from": "Test User <user@example.com>",
             "message_id": "<abc@gmail.com>",
             "references": "",
             "thread_id": "thread123",
         }
-        my_email = "zhengli.sun@doordash.com"
+        my_email = "user@example.com"
 
         # Mock the Gmail API service
         mock_service = mock.MagicMock()
@@ -371,9 +371,9 @@ class TestListSessionsSlug:
     """Slug must replace both '/' and '.' with '-'."""
 
     def test_slug_replaces_dots_and_slashes(self, tmp_path):
-        """Paths like /Users/zhengli.sun/Projects produce correct slug."""
-        cwd = "/Users/zhengli.sun/Projects"
-        expected_slug = "-Users-zhengli-sun-Projects"
+        """Paths like /Users/jane.doe/Projects produce correct slug."""
+        cwd = "/Users/jane.doe/Projects"
+        expected_slug = "-Users-jane-doe-Projects"
 
         sessions_dir = tmp_path / expected_slug
         sessions_dir.mkdir()
@@ -388,8 +388,8 @@ class TestListSessionsSlug:
 
     def test_slug_without_dot_fix_would_fail(self, tmp_path):
         """Verify the old slug (dots NOT replaced) would miss the directory."""
-        cwd = "/Users/zhengli.sun/Projects"
-        wrong_slug = "-Users-zhengli.sun-Projects"
+        cwd = "/Users/jane.doe/Projects"
+        wrong_slug = "-Users-jane.doe-Projects"
 
         sessions_dir = tmp_path / wrong_slug
         sessions_dir.mkdir()

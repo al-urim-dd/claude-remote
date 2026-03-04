@@ -1,4 +1,4 @@
-#!/Users/zhengli.sun/Projects/claude-remote/.venv/bin/python
+#!/usr/bin/env python3
 """ClaudeRemote: Gmail remote interface for Claude Code.
 
 Polls Gmail for emails with "cc" subject prefix, feeds them to Claude Code
@@ -54,7 +54,7 @@ SCOPES = [
 POLL_INTERVAL = 30  # seconds
 CLAUDE_TIMEOUT = 600  # 10 minutes
 MAX_RESPONSE_LEN = 50_000  # chars
-CLAUDE_CWD = "/Users/zhengli.sun/Projects"
+CLAUDE_CWD = str(Path.home() / "Projects")
 SUBJECT_PREFIX = "cc"
 REPLY_SENDER_NAME = "ClaudeRemote"  # Display name on reply emails
 ATTACHMENTS_DIR = CONFIG_DIR / "attachments"

@@ -48,11 +48,11 @@ mv ~/Downloads/client_secret_*.json ~/.claude-remote/client_secret.json
 
 ```bash
 # Foreground (for testing -- see logs in terminal)
-./bridge.py run
+.venv/bin/python bridge.py run
 
 # Background daemon
-./bridge.py start
-./bridge.py stop
+.venv/bin/python bridge.py start
+.venv/bin/python bridge.py stop
 
 # Tail logs
 tail -f ~/.claude-remote/bridge.log
@@ -118,7 +118,7 @@ echo "xoxb-your-token" > ~/.claude-remote/slack_token.txt
 export CLAUDE_REMOTE_SLACK_CHANNEL=C0123456789
 
 # Run
-./slack_bridge.py start
+.venv/bin/python slack_bridge.py start
 ```
 
 See [PR #16](https://github.com/zhengli-sun/claude-remote/pull/16) for full setup instructions.
