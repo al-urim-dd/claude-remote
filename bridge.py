@@ -910,7 +910,7 @@ def _poll_cycle(
             if summary_sent and "id" in summary_sent:
                 processed_ids.add(summary_sent["id"])
                 save_processed_id(summary_sent["id"])
-            SUMMARY_LAST_SENT_FILE.write_text(datetime.now().strftime("%Y-%m-%d"))
+            # Don't mark auto-summary as sent — manual /summary is on-demand
             mark_as_read(service, msg_id)
             processed_ids.add(msg_id)
             save_processed_id(msg_id)
