@@ -71,6 +71,7 @@ Available commands and capabilities:
 /resume <session-id> -- Resume a specific session
 /cancel -- Cancel a running task (coming soon)
 /summary -- Generate and send a work summary for today
+/brief -- Morning briefing with TODOs, calendar, PRs, email, Slack
 
 Regular messages -- Sent to Claude Code for processing
 Attachments -- Attach files to emails and Claude will analyze them
@@ -81,37 +82,6 @@ DIGEST_ENABLED = True
 DIGEST_HOUR = 8  # Send digest at 8am local time
 DIGEST_LAST_SENT_FILE = CONFIG_DIR / "digest_last_sent.txt"
 
-JOURNAL_FILE = Path.home() / "Projects" / "notes" / "journal" / "2026.md"
-
-DIGEST_PROMPT = """\
-Generate a concise morning briefing email for today. Read these inputs and synthesize:
-
-1. **Journal TODOs** — Here is my work journal. Extract ALL unchecked TODOs ([ ]) from the current week and the "Open" section at the top. Group by project. Ignore completed ([x]) items.
-
-```markdown
-{journal}
-```
-
-2. **PRs needing my review** — Here is a list of open PRs requesting my review:
-{pending_prs}
-
-3. **Today's calendar** — Check my Google Calendar for today's meetings (use get_events with detailed=True). Only include events where my responseStatus is "accepted" or "tentative".
-
-Format the briefing as:
-
-**Today's Focus** (top 3 priorities from the TODOs)
-
-**Open TODOs** (grouped by project, with unchecked items only)
-
-**PRs to Review** (list with PR number, title, author)
-
-**Today's Meetings** (time and title, chronological)
-
-Keep it scannable on a phone. Use markdown.
-Today's date: {date}
-Today (YYYY-MM-DD): {today}
-My email: {email}"""
-
 CANCEL_FILE = CONFIG_DIR / "cancel.txt"
 
 RATE_LIMIT_PER_HOUR = 20  # Max Claude invocations per hour
@@ -120,42 +90,6 @@ RATE_LIMIT_FILE = CONFIG_DIR / "rate_limit.json"  # Tracks invocation timestamps
 SUMMARY_ENABLED = True
 SUMMARY_HOUR = 16  # Send work summary at 4pm local time
 SUMMARY_LAST_SENT_FILE = CONFIG_DIR / "summary_last_sent.txt"
-SUMMARY_PROMPT = """\
-Generate a concise end-of-day work summary for today. Compare what I planned vs what I actually did.
-
-Here is my work journal with today's planned TODOs:
-
-```markdown
-{journal}
-```
-
-Now gather what I actually did today:
-
-1. **PRs** — Use `gh` CLI to find PRs I worked on today. Run ALL of these commands:
-   - PRs I authored: `gh search prs --author=@me --updated=">={yesterday}" --json number,title,repository,url,state`
-   - PRs I reviewed: `gh search prs --reviewed-by=@me --updated=">={yesterday}" --json number,title,repository,url,author`
-   Combine and deduplicate the results. Label each as (authored/reviewed).
-2. **Documents I edited today** — Use Glean search (NOT Google Drive API) to find docs I actually edited.
-   Use the `search` tool with query="*", from="me", updated="today".
-   Only include documents where I made actual changes.
-3. **Calendar** — List meetings I had today (use Google Calendar with detailed=True). Only include events where my responseStatus is "accepted" or "tentative".
-
-Format the summary as:
-
-**Completed Today** (TODOs from journal that are now done, plus work not in the journal)
-
-**Still Open** (unchecked TODOs from the current week that remain)
-
-**PRs** (authored/reviewed today)
-
-**Docs Edited** (from Glean)
-
-**Meetings Attended** (from calendar)
-
-Keep it scannable on a phone. Use markdown.
-Today's date: {date}
-Today (YYYY-MM-DD): {today}
-My email: {email}"""
 
 # Module-level state (set in run_bridge)
 _startup_time: datetime | None = None
@@ -711,89 +645,43 @@ def _record_invocation():
 # ---------------------------------------------------------------------------
 
 
-def get_pending_reviews() -> list[dict]:
-    """Get PRs requesting your review via the gh CLI."""
-    try:
-        result = subprocess.run(
-            ["gh", "search", "prs", "--review-requested=@me", "--state=open",
-             "--json", "number,title,repository,url,author", "--limit", "20"],
-            capture_output=True, text=True, timeout=30,
-        )
-        if result.returncode != 0 or not result.stdout.strip():
-            return []
-        prs = json.loads(result.stdout)
-        return [
-            {
-                "number": pr["number"],
-                "title": pr["title"],
-                "repo": pr.get("repository", {}).get("nameWithOwner", ""),
-                "url": pr["url"],
-                "author": pr.get("author", {}).get("login", "unknown"),
-            }
-            for pr in prs
-        ]
-    except (FileNotFoundError, subprocess.TimeoutExpired, json.JSONDecodeError):
-        return []
+
+def _invoke_skill(skill_name: str) -> str:
+    """Invoke a Claude Code skill (e.g. /brief, /summary) via claude -p."""
+    return invoke_claude(f"/{skill_name}", str(uuid.uuid4()), resume=False)
 
 
-def send_daily_digest(service, my_email: str, thread_sessions: dict, processed_count: int):
-    """Send a morning briefing by invoking Claude with journal + PRs + calendar."""
-    now = datetime.now()
-
-    # Check if we already sent today
-    if DIGEST_LAST_SENT_FILE.exists():
-        last_sent = DIGEST_LAST_SENT_FILE.read_text().strip()
-        if last_sent == now.strftime("%Y-%m-%d"):
-            return
-
-    log.info("Generating morning briefing via Claude")
-
-    # Read journal (first 150 lines covers current + last week)
-    journal_text = ""
-    if JOURNAL_FILE.exists():
-        lines = JOURNAL_FILE.read_text().splitlines()
-        journal_text = "\n".join(lines[:150])
-    else:
-        journal_text = "(Journal file not found)"
-
-    # Get pending PRs
-    pending_prs = get_pending_reviews()
-    if pending_prs:
-        prs_text = "\n".join(
-            f"  - #{pr['number']} {pr['title']} ({pr['repo']} by {pr['author']}) {pr['url']}"
-            for pr in pending_prs
-        )
-    else:
-        prs_text = "  (none)"
-
-    from datetime import timedelta
-    prompt = DIGEST_PROMPT.format(
-        journal=journal_text,
-        pending_prs=prs_text,
-        date=now.strftime("%Y-%m-%d (%A)"),
-        today=now.strftime("%Y-%m-%d"),
-        email=my_email,
-    )
-
-    session_id = str(uuid.uuid4())
-    body = invoke_claude(prompt, session_id, resume=False)
-
-    if not body or body.startswith("["):
-        log.warning("Morning briefing generation failed: %s", body[:100] if body else "empty")
-        return
-
-    # Send as HTML
+def _send_scheduled_email(service, my_email: str, subject: str, body: str):
+    """Send a styled HTML email to the user."""
     html = format_html_reply(body)
     msg_mime = MIMEMultipart("alternative")
     msg_mime.attach(MIMEText(body, "plain"))
     msg_mime.attach(MIMEText(html, "html"))
     msg_mime["from"] = f"ClaudeRemote <{my_email}>"
     msg_mime["to"] = my_email
-    msg_mime["subject"] = f"[ClaudeRemote] Morning Briefing -- {now.strftime('%b %d')}"
-
+    msg_mime["subject"] = subject
     raw = base64.urlsafe_b64encode(msg_mime.as_bytes()).decode("ascii")
     service.users().messages().send(userId="me", body={"raw": raw}).execute()
 
+
+def send_daily_digest(service, my_email: str, thread_sessions: dict, processed_count: int):
+    """Send a morning briefing by invoking the /brief skill."""
+    now = datetime.now()
+
+    if DIGEST_LAST_SENT_FILE.exists():
+        last_sent = DIGEST_LAST_SENT_FILE.read_text().strip()
+        if last_sent == now.strftime("%Y-%m-%d"):
+            return
+
+    log.info("Generating morning briefing via /brief skill")
+    body = _invoke_skill("brief")
+
+    if not body or body.startswith("["):
+        log.warning("Morning briefing failed: %s", body[:100] if body else "empty")
+        return
+
+    _send_scheduled_email(service, my_email,
+                          f"[ClaudeRemote] Morning Briefing -- {now.strftime('%b %d')}", body)
     DIGEST_LAST_SENT_FILE.write_text(now.strftime("%Y-%m-%d"))
     log.info("Sent morning briefing")
 
@@ -814,56 +702,25 @@ def _maybe_send_digest(service, my_email, thread_sessions, processed_count):
 
 
 def send_work_summary(service, my_email: str):
-    """Invoke Claude to generate a work summary and email it to the user."""
+    """Send an end-of-day work summary by invoking the /summary skill."""
     now = datetime.now()
 
-    # Check if we already sent today
     if SUMMARY_LAST_SENT_FILE.exists():
         last_sent = SUMMARY_LAST_SENT_FILE.read_text().strip()
         if last_sent == now.strftime("%Y-%m-%d"):
             return
 
-    log.info("Generating daily work summary via Claude")
+    log.info("Generating work summary via /summary skill")
+    body = _invoke_skill("summary")
 
-    # Read journal for planned vs actual comparison
-    journal_text = ""
-    if JOURNAL_FILE.exists():
-        lines = JOURNAL_FILE.read_text().splitlines()
-        journal_text = "\n".join(lines[:150])
-    else:
-        journal_text = "(Journal file not found)"
-
-    from datetime import timedelta
-    prompt = SUMMARY_PROMPT.format(
-        journal=journal_text,
-        date=now.strftime("%Y-%m-%d (%A)"),
-        today=now.strftime("%Y-%m-%d"),
-        yesterday=(now - timedelta(days=1)).strftime("%Y-%m-%d"),
-        email=my_email,
-    )
-
-    session_id = str(uuid.uuid4())
-    summary = invoke_claude(prompt, session_id, resume=False)
-
-    if not summary or summary.startswith("["):
-        log.warning("Work summary generation failed: %s", summary[:100])
+    if not body or body.startswith("["):
+        log.warning("Work summary failed: %s", body[:100] if body else "empty")
         return
 
-    # Send as HTML email (Claude output is markdown)
-    html = format_html_reply(summary)
-
-    msg_mime = MIMEMultipart("alternative")
-    msg_mime.attach(MIMEText(summary, "plain"))
-    msg_mime.attach(MIMEText(html, "html"))
-    msg_mime["from"] = f"ClaudeRemote <{my_email}>"
-    msg_mime["to"] = my_email
-    msg_mime["subject"] = f"[ClaudeRemote] Work Summary -- {now.strftime('%b %d')}"
-
-    raw = base64.urlsafe_b64encode(msg_mime.as_bytes()).decode("ascii")
-    service.users().messages().send(userId="me", body={"raw": raw}).execute()
-
+    _send_scheduled_email(service, my_email,
+                          f"[ClaudeRemote] Work Summary -- {now.strftime('%b %d')}", body)
     SUMMARY_LAST_SENT_FILE.write_text(now.strftime("%Y-%m-%d"))
-    log.info("Sent daily work summary")
+    log.info("Sent work summary")
 
 
 def _maybe_send_summary(service, my_email):
@@ -1047,28 +904,24 @@ def _poll_cycle(
             save_processed_id(msg_id)
             continue
         if body.lower() == "/summary":
-            log.info("Manual work summary requested")
-            journal_text = ""
-            if JOURNAL_FILE.exists():
-                jlines = JOURNAL_FILE.read_text().splitlines()
-                journal_text = "\n".join(jlines[:150])
-            from datetime import timedelta
-            _now = datetime.now()
-            prompt = SUMMARY_PROMPT.format(
-                journal=journal_text or "(no journal found)",
-                date=_now.strftime("%Y-%m-%d (%A)"),
-                today=_now.strftime("%Y-%m-%d"),
-                yesterday=(_now - timedelta(days=1)).strftime("%Y-%m-%d"),
-                email=my_email,
-            )
-            session_id = str(uuid.uuid4())
-            response = invoke_claude(prompt, session_id, resume=False)
+            log.info("Manual work summary requested via /summary skill")
+            response = _invoke_skill("summary")
             summary_sent = send_reply(service, msg, response, my_email)
             if summary_sent and "id" in summary_sent:
                 processed_ids.add(summary_sent["id"])
                 save_processed_id(summary_sent["id"])
-            # Mark summary as sent so the auto-summary at SUMMARY_HOUR skips
-            SUMMARY_LAST_SENT_FILE.write_text(_now.strftime("%Y-%m-%d"))
+            SUMMARY_LAST_SENT_FILE.write_text(datetime.now().strftime("%Y-%m-%d"))
+            mark_as_read(service, msg_id)
+            processed_ids.add(msg_id)
+            save_processed_id(msg_id)
+            continue
+        if body.lower() == "/brief":
+            log.info("Manual morning brief requested via /brief skill")
+            response = _invoke_skill("brief")
+            brief_sent = send_reply(service, msg, response, my_email)
+            if brief_sent and "id" in brief_sent:
+                processed_ids.add(brief_sent["id"])
+                save_processed_id(brief_sent["id"])
             mark_as_read(service, msg_id)
             processed_ids.add(msg_id)
             save_processed_id(msg_id)
