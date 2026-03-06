@@ -88,7 +88,7 @@ RATE_LIMIT_PER_HOUR = 20  # Max Claude invocations per hour
 RATE_LIMIT_FILE = CONFIG_DIR / "rate_limit.json"  # Tracks invocation timestamps
 
 SUMMARY_ENABLED = True
-SUMMARY_HOUR = 16  # Send work summary at 4pm local time
+SUMMARY_HOUR = 22  # Send work summary at 10pm local time
 SUMMARY_LAST_SENT_FILE = CONFIG_DIR / "summary_last_sent.txt"
 
 # Module-level state (set in run_bridge)
@@ -687,10 +687,12 @@ def send_daily_digest(service, my_email: str, thread_sessions: dict, processed_c
 
 
 def _maybe_send_digest(service, my_email, thread_sessions, processed_count):
-    """Send digest if it is the right hour and has not been sent today."""
+    """Send digest if it is the right hour, not weekend, and not sent today."""
     if not DIGEST_ENABLED:
         return
     now = datetime.now()
+    if now.weekday() >= 5:  # Skip Saturday (5) and Sunday (6)
+        return
     if now.hour != DIGEST_HOUR:
         return
     send_daily_digest(service, my_email, thread_sessions, processed_count)
@@ -724,10 +726,12 @@ def send_work_summary(service, my_email: str):
 
 
 def _maybe_send_summary(service, my_email):
-    """Send work summary if it is the right hour and has not been sent today."""
+    """Send work summary if it is the right hour, not weekend, and not sent today."""
     if not SUMMARY_ENABLED:
         return
     now = datetime.now()
+    if now.weekday() >= 5:  # Skip Saturday (5) and Sunday (6)
+        return
     if now.hour != SUMMARY_HOUR:
         return
     send_work_summary(service, my_email)
