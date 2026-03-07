@@ -175,6 +175,7 @@ Edit constants at the top of `bridge.py`, or use environment variables:
 | `BUSINESS_HOURS_START` | `8` | `CLAUDE_REMOTE_BIZ_START` | Slack business hours start |
 | `BUSINESS_HOURS_END` | `22` | `CLAUDE_REMOTE_BIZ_END` | Slack business hours end |
 | `BUSINESS_HOURS_ONLY` | `false` | `CLAUDE_REMOTE_BIZ_ONLY` | Gate Slack polls to business hours |
+| `SLACK_CHANNEL_NAME` | `zhengli-agent` | `CLAUDE_REMOTE_SLACK_CHANNEL` | Slack channel to watch for messages |
 
 ## Security
 
