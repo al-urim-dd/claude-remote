@@ -18,7 +18,7 @@ Gmail / Slack  ->  bridge.py (polls every 30s)
 
 **Gmail**: send yourself an email with subject prefix "cc". Bridge replies as "ClaudeRemote".
 
-**Slack**: post in your private `#zhengli-agent` channel. Bridge reads via MCP HTTP (no bot token needed), invokes Claude, replies in-thread with :robot_face: prefix. Acknowledges messages with :eyes: emoji on receipt, :white_check_mark: on reply.
+**Slack**: post in your private `#your-agent-channel` channel. Bridge reads via MCP HTTP (no bot token needed), invokes Claude, replies in-thread with :robot_face: prefix. Acknowledges messages with :eyes: emoji on receipt, :white_check_mark: on reply.
 
 ## Quick Start
 
@@ -43,7 +43,7 @@ mv ~/Downloads/client_secret_*.json ~/.claude-remote/client_secret.json
 No bot token or Slack app needed. The bridge reuses the OAuth token that Claude Code already stores for the Slack MCP plugin.
 
 1. Make sure the Slack MCP plugin is authenticated in Claude Code (run any Slack tool once)
-2. Create a private channel `#zhengli-agent` in Slack
+2. Create a private channel `#your-agent-channel` in Slack
 3. Run `/check-slack` in Claude Code to initialize the channel state
 
 ## Usage
@@ -79,7 +79,7 @@ The bridge picks it up within ~30 seconds and replies in the same thread.
 
 ### Slack
 
-Post in `#zhengli-agent`:
+Post in `#your-agent-channel`:
 
 ```
 summarize #eng-incidents from the last 2 hours
@@ -180,7 +180,7 @@ Edit constants at the top of `bridge.py`, or use environment variables:
 
 - **Sender check** (Gmail): only processes emails from your own address
 - **Subject gate** (Gmail): only emails with "cc" prefix
-- **Private channel** (Slack): only watches your private `#zhengli-agent` channel
+- **Private channel** (Slack): only watches your private `#your-agent-channel` channel
 - **Rate limiting**: 20 invocations/hour cap prevents runaway costs
 - **Startup safety**: ignores all existing messages on daemon start
 - **Local only**: all processing on your laptop, API calls over HTTPS

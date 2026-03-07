@@ -107,6 +107,7 @@ AGENT_PREFIX = ":robot_face:"
 BUSINESS_HOURS_START = int(os.environ.get("CLAUDE_REMOTE_BIZ_START", "8"))
 BUSINESS_HOURS_END = int(os.environ.get("CLAUDE_REMOTE_BIZ_END", "22"))
 BUSINESS_HOURS_ONLY = os.environ.get("CLAUDE_REMOTE_BIZ_ONLY", "false").lower() == "true"
+SLACK_CHANNEL_NAME = os.environ.get("CLAUDE_REMOTE_SLACK_CHANNEL", "zhengli-agent")
 
 # Module-level state (set in run_bridge)
 _startup_time: Optional[datetime] = None
@@ -1336,14 +1337,14 @@ def load_slack_state() -> dict:
     if not SLACK_STATE_FILE.exists():
         return {
             "channel_id": "",
-            "channel_name": "zhengli-agent",
+            "channel_name": SLACK_CHANNEL_NAME,
             "last_checked_ts": "",
             "active_threads": {},
         }
     try:
         return json.loads(SLACK_STATE_FILE.read_text())
     except (json.JSONDecodeError, ValueError):
-        return {"channel_id": "", "channel_name": "zhengli-agent", "last_checked_ts": "", "active_threads": {}}
+        return {"channel_id": "", "channel_name": SLACK_CHANNEL_NAME, "last_checked_ts": "", "active_threads": {}}
 
 
 def save_slack_state(state: dict):
