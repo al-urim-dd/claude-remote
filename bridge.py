@@ -1,15 +1,19 @@
 #!/usr/bin/env python3
-"""ClaudeRemote: Gmail remote interface for Claude Code.
+"""ClaudeRemote: unified Gmail + Slack remote interface for Claude Code.
 
-Polls Gmail for emails with "cc" subject prefix, feeds them to Claude Code
-via subprocess, and replies in the same email thread.
+Polls Gmail for emails with "cc" subject prefix and/or Slack via MCP for
+new messages, feeds them to Claude Code via subprocess, and replies in the
+same email thread or Slack thread.
 
 Usage:
-    ./bridge.py start   # Start daemon (background)
-    ./bridge.py stop    # Stop daemon
-    ./bridge.py run     # Run in foreground (for debugging)
+    ./bridge.py run [--gmail] [--slack] [--all]   # Run in foreground
+    ./bridge.py start [--gmail] [--slack] [--all]  # Start daemon
+    ./bridge.py stop                                # Stop daemon
+    ./bridge.py status                              # Show status
 """
+from __future__ import annotations
 
+import argparse
 import base64
 import email.utils
 import fcntl
@@ -27,6 +31,10 @@ from datetime import datetime, timezone
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from pathlib import Path
+from typing import Optional
+from urllib.error import HTTPError, URLError
+from urllib.request import Request as URLRequest
+from urllib.request import urlopen
 
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
@@ -40,7 +48,7 @@ from googleapiclient.discovery import build
 CONFIG_DIR = Path.home() / ".claude-remote"
 CLIENT_SECRET = CONFIG_DIR / "client_secret.json"
 TOKEN_FILE = CONFIG_DIR / "token.json"
-PROCESSED_FILE = CONFIG_DIR / "processed.txt"
+GMAIL_PROCESSED_FILE = CONFIG_DIR / "processed.txt"
 SESSIONS_FILE = CONFIG_DIR / "thread_sessions.json"
 PID_FILE = CONFIG_DIR / "bridge.pid"
 LOCK_FILE = CONFIG_DIR / "bridge.lock"
@@ -51,7 +59,7 @@ SCOPES = [
     "https://www.googleapis.com/auth/gmail.send",
 ]
 
-POLL_INTERVAL = 30  # seconds
+POLL_INTERVAL = int(os.environ.get("CLAUDE_REMOTE_POLL_INTERVAL", "30"))
 CLAUDE_TIMEOUT = 600  # 10 minutes
 MAX_RESPONSE_LEN = 50_000  # chars
 CLAUDE_CWD = str(Path.home() / "Projects")
@@ -91,8 +99,17 @@ SUMMARY_ENABLED = True
 SUMMARY_HOUR = 22  # Send work summary at 10pm local time
 SUMMARY_LAST_SENT_FILE = CONFIG_DIR / "summary_last_sent.txt"
 
+# Slack MCP
+CREDENTIALS_FILE = Path.home() / ".claude" / ".credentials.json"
+SLACK_STATE_FILE = CONFIG_DIR / "slack_agent_state.json"
+MCP_URL = "https://mcp.slack.com/mcp"
+AGENT_PREFIX = ":robot_face:"
+BUSINESS_HOURS_START = int(os.environ.get("CLAUDE_REMOTE_BIZ_START", "8"))
+BUSINESS_HOURS_END = int(os.environ.get("CLAUDE_REMOTE_BIZ_END", "22"))
+BUSINESS_HOURS_ONLY = os.environ.get("CLAUDE_REMOTE_BIZ_ONLY", "false").lower() == "true"
+
 # Module-level state (set in run_bridge)
-_startup_time: datetime | None = None
+_startup_time: Optional[datetime] = None
 _messages_processed: int = 0
 
 # ---------------------------------------------------------------------------
@@ -102,18 +119,41 @@ _messages_processed: int = 0
 log = logging.getLogger("claude-remote")
 
 
+class _FlushFileHandler(logging.FileHandler):
+    """FileHandler that flushes after every emit."""
+    def emit(self, record):
+        super().emit(record)
+        self.flush()
+
+
 def setup_logging(foreground: bool = False):
+    log.handlers.clear()
     log.setLevel(logging.INFO)
     formatter = logging.Formatter(
         "%(asctime)s %(levelname)s %(message)s", datefmt="%Y-%m-%d %H:%M:%S"
     )
-    file_handler = logging.FileHandler(LOG_FILE)
-    file_handler.setFormatter(formatter)
-    log.addHandler(file_handler)
+    fh = _FlushFileHandler(LOG_FILE, mode="a")
+    fh.setLevel(logging.INFO)
+    fh.setFormatter(formatter)
+    log.addHandler(fh)
     if foreground:
-        stream_handler = logging.StreamHandler()
-        stream_handler.setFormatter(formatter)
-        log.addHandler(stream_handler)
+        sh = logging.StreamHandler(sys.stderr)
+        sh.setLevel(logging.INFO)
+        sh.setFormatter(formatter)
+        log.addHandler(sh)
+
+
+# ---------------------------------------------------------------------------
+# Shared Utilities
+# ---------------------------------------------------------------------------
+
+
+def is_business_hours() -> bool:
+    """Check if we are within business hours (for Slack gating)."""
+    if not BUSINESS_HOURS_ONLY:
+        return True
+    hour = datetime.now().hour
+    return BUSINESS_HOURS_START <= hour < BUSINESS_HOURS_END
 
 
 # ---------------------------------------------------------------------------
@@ -158,7 +198,7 @@ def get_my_email(service) -> str:
     return profile["emailAddress"]
 
 
-def search_messages(service, query: str) -> list[dict]:
+def search_messages(service, query: str) -> list:
     """Search Gmail and return list of {id, threadId}."""
     results = (
         service.users().messages().list(userId="me", q=query).execute()
@@ -252,7 +292,7 @@ def generate_subject(body: str, max_len: int = 50) -> str:
     return f"cc {first_line}" if first_line else "cc conversation"
 
 
-def _extract_attachments(payload: dict) -> list[dict]:
+def _extract_attachments(payload: dict) -> list:
     """Extract attachment metadata (filename, size, id) from a MIME payload."""
     attachments = []
     for part in payload.get("parts", []):
@@ -270,7 +310,7 @@ def _extract_attachments(payload: dict) -> list[dict]:
     return attachments
 
 
-def download_attachments(service, msg_id: str, attachment_metas: list[dict]) -> list[Path]:
+def download_attachments(service, msg_id: str, attachment_metas: list) -> list:
     """Download attachments to disk and return list of file paths."""
     if not attachment_metas:
         return []
@@ -316,7 +356,7 @@ def cleanup_old_attachments():
             shutil.rmtree(child, ignore_errors=True)
 
 
-def get_thread_history(service, thread_id: str) -> list[dict]:
+def get_thread_history(service, thread_id: str) -> list:
     """Fetch all messages in a thread, sorted chronologically."""
     thread = (
         service.users()
@@ -337,7 +377,7 @@ def get_thread_history(service, thread_id: str) -> list[dict]:
     return messages
 
 
-def build_thread_context(thread_messages: list[dict]) -> str:
+def build_thread_context(thread_messages: list) -> str:
     """Format thread history as a conversation for Claude."""
     parts = []
     for msg in thread_messages:
@@ -454,12 +494,15 @@ def _check_cancel(thread_id: str) -> bool:
 
 def invoke_claude(
     message: str,
-    session_id: str,
+    session_id: Optional[str] = None,
     resume: bool = False,
-    on_progress: callable = None,
-    thread_id: str = None,
+    on_progress: Optional[object] = None,
+    thread_id: Optional[str] = None,
 ) -> str:
     """Run claude -p as a subprocess, sending progress callbacks while waiting."""
+    if session_id is None:
+        session_id = str(uuid.uuid4())
+
     env = os.environ.copy()
     env.pop("CLAUDECODE", None)  # Strip nested session guard
 
@@ -567,24 +610,24 @@ def list_sessions(count: int = 10) -> str:
 
 
 # ---------------------------------------------------------------------------
-# State Management
+# Gmail State Management
 # ---------------------------------------------------------------------------
 
 
-def load_processed_ids() -> set[str]:
+def load_processed_ids() -> set:
     """Load processed message IDs from file."""
-    if not PROCESSED_FILE.exists():
+    if not GMAIL_PROCESSED_FILE.exists():
         return set()
-    return set(PROCESSED_FILE.read_text().strip().splitlines())
+    return set(GMAIL_PROCESSED_FILE.read_text().strip().splitlines())
 
 
 def save_processed_id(msg_id: str):
     """Append a processed message ID to file."""
-    with open(PROCESSED_FILE, "a") as f:
+    with open(GMAIL_PROCESSED_FILE, "a") as f:
         f.write(msg_id + "\n")
 
 
-def load_thread_sessions() -> dict[str, str]:
+def load_thread_sessions() -> dict:
     """Load thread->session mapping from JSON file."""
     if not SESSIONS_FILE.exists():
         return {}
@@ -594,7 +637,7 @@ def load_thread_sessions() -> dict[str, str]:
         return {}
 
 
-def save_thread_sessions(sessions: dict[str, str]):
+def save_thread_sessions(sessions: dict):
     """Save thread->session mapping to JSON file."""
     SESSIONS_FILE.write_text(json.dumps(sessions, indent=2))
 
@@ -604,7 +647,7 @@ def save_thread_sessions(sessions: dict[str, str]):
 # ---------------------------------------------------------------------------
 
 
-def _check_rate_limit() -> tuple[bool, int]:
+def _check_rate_limit() -> tuple:
     """Check if we're within the rate limit. Returns (allowed, remaining)."""
     now = time.time()
     cutoff = now - 3600  # 1 hour window
@@ -643,7 +686,6 @@ def _record_invocation():
 # ---------------------------------------------------------------------------
 # Daily Digest
 # ---------------------------------------------------------------------------
-
 
 
 def _invoke_skill(skill_name: str) -> str:
@@ -738,79 +780,18 @@ def _maybe_send_summary(service, my_email):
 
 
 # ---------------------------------------------------------------------------
-# Main Polling Loop
+# Gmail Poll Cycle
 # ---------------------------------------------------------------------------
 
 
-def run_bridge(foreground: bool = False):
-    """Main loop: poll Gmail, process messages, reply."""
-    global _startup_time, _messages_processed
-    setup_logging(foreground=foreground)
-    _messages_processed = 0
-    log.info("Starting ClaudeRemote")
-
-    # Authenticate
-    try:
-        service = authenticate()
-    except Exception as e:
-        log.error("Authentication failed: %s", e)
-        print(f"Authentication failed: {e}", file=sys.stderr)
-        sys.exit(1)
-
-    my_email = get_my_email(service)
-    log.info("Authenticated as %s", my_email)
-
-    # Load state
-    processed_ids = load_processed_ids()
-    thread_sessions = load_thread_sessions()
-
-    # Record startup time -- ignore messages older than this
-    startup_time_ms = int(time.time() * 1000)
-    _startup_time = datetime.now(timezone.utc)
-    log.info("Startup time: %s (ignoring older messages)", _startup_time.isoformat())
-    log.info("Loaded %d processed IDs, %d thread sessions", len(processed_ids), len(thread_sessions))
-
-    # Graceful shutdown
-    running = True
-
-    def handle_signal(signum, frame):
-        nonlocal running
-        log.info("Received signal %d, shutting down...", signum)
-        running = False
-
-    signal.signal(signal.SIGINT, handle_signal)
-    signal.signal(signal.SIGTERM, handle_signal)
-
-    while running:
-        try:
-            log.info("Starting poll cycle")
-            _poll_cycle(service, my_email, processed_ids, thread_sessions, startup_time_ms)
-            log.info("Poll cycle complete")
-        except Exception:
-            log.exception("Error in poll cycle")
-            # Re-authenticate in case token issues
-            try:
-                service = authenticate()
-            except Exception:
-                log.exception("Re-authentication failed")
-
-        # Sleep in small increments so we respond to signals
-        for _ in range(POLL_INTERVAL):
-            if not running:
-                break
-            time.sleep(1)
-
-    log.info("ClaudeRemote stopped")
-
-
-def _poll_cycle(
+def gmail_poll_cycle(
     service,
     my_email: str,
-    processed_ids: set[str],
-    thread_sessions: dict[str, str],
+    processed_ids: set,
+    thread_sessions: dict,
     startup_time_ms: int,
 ):
-    """Single poll iteration."""
+    """Single Gmail poll iteration."""
     cleanup_old_attachments()
     _maybe_send_digest(service, my_email, thread_sessions, len(processed_ids))
     _maybe_send_summary(service, my_email)
@@ -914,7 +895,7 @@ def _poll_cycle(
             if summary_sent and "id" in summary_sent:
                 processed_ids.add(summary_sent["id"])
                 save_processed_id(summary_sent["id"])
-            # Don't mark auto-summary as sent — manual /summary is on-demand
+            # Don't mark auto-summary as sent - manual /summary is on-demand
             mark_as_read(service, msg_id)
             processed_ids.add(msg_id)
             save_processed_id(msg_id)
@@ -1059,6 +1040,615 @@ def _poll_cycle(
 
 
 # ---------------------------------------------------------------------------
+# Slack MCP Token Management
+# ---------------------------------------------------------------------------
+
+
+def _load_credentials() -> dict:
+    """Load the Claude Code credentials file."""
+    if not CREDENTIALS_FILE.exists():
+        log.error("Credentials file not found: %s", CREDENTIALS_FILE)
+        return {}
+    return json.loads(CREDENTIALS_FILE.read_text())
+
+
+def _find_slack_token_entry(creds: dict) -> Optional[dict]:
+    """Find the active Slack MCP OAuth entry."""
+    mcp_oauth = creds.get("mcpOAuth", {})
+    for key, entry in mcp_oauth.items():
+        if "slack" not in key:
+            continue
+        server_url = entry.get("serverUrl", "")
+        access_token = entry.get("accessToken", "")
+        if "mcp.slack.com/mcp" in server_url and access_token:
+            return entry
+    return None
+
+
+def get_slack_token() -> Optional[str]:
+    """Get the current Slack OAuth access token from Claude Code credentials."""
+    creds = _load_credentials()
+    entry = _find_slack_token_entry(creds)
+    if not entry:
+        log.error("No active Slack MCP token found in credentials")
+        return None
+
+    # Check expiry
+    expires_at = entry.get("expiresAt", 0)
+    now_ms = int(time.time() * 1000)
+    if expires_at and now_ms > expires_at:
+        log.warning(
+            "Slack token expired at %s. Run any Slack MCP tool in Claude Code "
+            "to refresh it, then restart the bridge.",
+            datetime.fromtimestamp(expires_at / 1000).isoformat(),
+        )
+        return None
+
+    return entry["accessToken"]
+
+
+# ---------------------------------------------------------------------------
+# Slack MCP API (direct HTTP, no LLM)
+# ---------------------------------------------------------------------------
+
+
+def _mcp_call(tool_name: str, arguments: dict, token: str) -> Optional[dict]:
+    """Call a Slack MCP tool via HTTP JSON-RPC."""
+    payload = json.dumps({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/call",
+        "params": {
+            "name": tool_name,
+            "arguments": arguments,
+        },
+    }).encode()
+
+    req = URLRequest(
+        MCP_URL,
+        data=payload,
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {token}",
+        },
+        method="POST",
+    )
+
+    try:
+        with urlopen(req, timeout=30) as resp:
+            body = json.loads(resp.read())
+            if "error" in body:
+                log.error("MCP error: %s", body["error"])
+                return None
+            return body.get("result", body)
+    except HTTPError as e:
+        log.error("MCP HTTP error %d: %s", e.code, e.read().decode()[:500])
+        return None
+    except (URLError, TimeoutError) as e:
+        log.error("MCP connection error: %s", e)
+        return None
+
+
+def _extract_mcp_text(result: dict) -> Optional[str]:
+    """Extract the text payload from an MCP tool result.
+
+    MCP returns: {"content": [{"type": "text", "text": "<json-string>"}]}
+    The text field is itself a JSON string like {"messages": "..."}.
+    We unwrap both layers and return the inner messages string.
+    """
+    if not isinstance(result, dict):
+        return None
+    # Extract text from content array
+    raw_text = None
+    if "content" in result:
+        for item in result["content"]:
+            if item.get("type") == "text":
+                raw_text = item["text"]
+                break
+    if raw_text is None:
+        return None
+    # The text is a JSON string - parse it and extract the messages field
+    try:
+        parsed = json.loads(raw_text)
+        if isinstance(parsed, dict) and "messages" in parsed:
+            return parsed["messages"]
+    except (json.JSONDecodeError, ValueError):
+        pass
+    # Fallback: return raw text as-is
+    return raw_text
+
+
+def mcp_read_channel(token: str, channel_id: str, oldest: str = "", limit: int = 50) -> Optional[str]:
+    """Read channel messages via MCP."""
+    args = {"channel_id": channel_id, "limit": limit}
+    if oldest:
+        args["oldest"] = oldest
+    result = _mcp_call("slack_read_channel", args, token)
+    if result is None:
+        return None
+    return _extract_mcp_text(result)
+
+
+def mcp_read_thread(token: str, channel_id: str, message_ts: str) -> Optional[str]:
+    """Read thread replies via MCP."""
+    result = _mcp_call("slack_read_thread", {
+        "channel_id": channel_id,
+        "message_ts": message_ts,
+    }, token)
+    if result is None:
+        return None
+    return _extract_mcp_text(result)
+
+
+def mcp_send_message(token: str, channel_id: str, thread_ts: str, message: str) -> bool:
+    """Send a message via MCP."""
+    result = _mcp_call("slack_send_message", {
+        "channel_id": channel_id,
+        "thread_ts": thread_ts,
+        "message": message,
+    }, token)
+    return result is not None
+
+
+def mcp_add_reaction(token: str, channel_id: str, message_ts: str, emoji: str = "eyes") -> bool:
+    """Add an emoji reaction to a message to acknowledge receipt.
+
+    Uses Slack Web API directly since the MCP server doesn't expose
+    reactions.add. The MCP OAuth token (xoxe.xoxp-*) works with the
+    Slack API.
+    """
+    payload = json.dumps({
+        "channel": channel_id,
+        "timestamp": message_ts,
+        "name": emoji,
+    }).encode()
+    req = URLRequest(
+        "https://slack.com/api/reactions.add",
+        data=payload,
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {token}",
+        },
+        method="POST",
+    )
+    try:
+        with urlopen(req, timeout=10) as resp:
+            body = json.loads(resp.read())
+            if not body.get("ok"):
+                log.warning("reactions.add failed: %s", body.get("error", "unknown"))
+                return False
+            return True
+    except (HTTPError, URLError) as e:
+        log.warning("reactions.add error: %s", e)
+        return False
+
+
+# ---------------------------------------------------------------------------
+# Slack Message Parsing
+# ---------------------------------------------------------------------------
+
+
+def parse_new_messages(channel_text: str, since_ts: str) -> list:
+    """Parse channel read output for new messages after since_ts."""
+    messages = []
+    current = {}
+    for line in channel_text.splitlines():
+        if line.startswith("=== Message from "):
+            if current:
+                messages.append(current)
+            current = {"user": "", "ts": "", "text_lines": []}
+            # Extract user
+            parts = line.split("(")
+            if len(parts) > 1:
+                current["user"] = parts[1].split(")")[0]
+        elif line.startswith("Message TS: "):
+            current["ts"] = line.replace("Message TS: ", "").strip()
+        elif current:
+            current["text_lines"].append(line)
+
+    if current:
+        messages.append(current)
+
+    # Filter to messages newer than since_ts, join text lines
+    result = []
+    for msg in messages:
+        ts = msg.get("ts", "")
+        if not ts:
+            continue
+        try:
+            if float(ts) <= float(since_ts):
+                continue
+        except ValueError:
+            continue
+        text = "\n".join(msg["text_lines"]).strip()
+        result.append({"user": msg["user"], "ts": ts, "text": text})
+
+    return result
+
+
+def parse_thread_replies(thread_text: str, since_ts: str) -> list:
+    """Parse thread read output for new replies after since_ts."""
+    replies = []
+    current = {}
+    in_replies = False
+    for line in thread_text.splitlines():
+        if "THREAD REPLIES" in line:
+            in_replies = True
+            continue
+        if not in_replies:
+            continue
+        if line.startswith("--- Reply "):
+            if current:
+                replies.append(current)
+            current = {"user": "", "ts": "", "text_lines": []}
+        elif line.startswith("From: "):
+            parts = line.split("(")
+            if len(parts) > 1:
+                current["user"] = parts[1].split(")")[0]
+        elif line.startswith("Message TS: "):
+            current["ts"] = line.replace("Message TS: ", "").strip()
+        elif current:
+            current["text_lines"].append(line)
+
+    if current:
+        replies.append(current)
+
+    result = []
+    for reply in replies:
+        ts = reply.get("ts", "")
+        if not ts:
+            continue
+        try:
+            if float(ts) <= float(since_ts):
+                continue
+        except ValueError:
+            continue
+        text = "\n".join(reply["text_lines"]).strip()
+        result.append({"user": reply["user"], "ts": ts, "text": text})
+
+    return result
+
+
+def should_process(msg: dict) -> bool:
+    """Check if a Slack message should be processed."""
+    text = msg.get("text", "")
+    # Skip agent output - check multiple markers to prevent self-reply loops
+    if AGENT_PREFIX in text:
+        return False
+    if "Sent using" in text and "Claude" in text:
+        return False
+    if "<@U09RKUYGCM6" in text:
+        return False
+    if "has joined the channel" in text:
+        return False
+    if not text.strip():
+        return False
+    return True
+
+
+# ---------------------------------------------------------------------------
+# Slack State Management
+# ---------------------------------------------------------------------------
+
+
+def load_slack_state() -> dict:
+    """Load Slack agent state from file."""
+    if not SLACK_STATE_FILE.exists():
+        return {
+            "channel_id": "",
+            "channel_name": "zhengli-agent",
+            "last_checked_ts": "",
+            "active_threads": {},
+        }
+    try:
+        return json.loads(SLACK_STATE_FILE.read_text())
+    except (json.JSONDecodeError, ValueError):
+        return {"channel_id": "", "channel_name": "zhengli-agent", "last_checked_ts": "", "active_threads": {}}
+
+
+def save_slack_state(state: dict):
+    """Save Slack agent state to file."""
+    SLACK_STATE_FILE.write_text(json.dumps(state, indent=2) + "\n")
+
+
+# ---------------------------------------------------------------------------
+# Slack Poll Cycle
+# ---------------------------------------------------------------------------
+
+
+def slack_poll_cycle(token: str, state: dict):
+    """Single Slack poll iteration."""
+    global _messages_processed
+    channel_id = state["channel_id"]
+    last_ts = state["last_checked_ts"]
+    active_threads = state.get("active_threads", {})
+
+    # 1. Check for new top-level messages
+    channel_text = mcp_read_channel(token, channel_id, oldest=last_ts)
+    if channel_text is None:
+        log.warning("Failed to read channel")
+        return
+
+    new_top_level = parse_new_messages(channel_text, last_ts)
+
+    # 2. Check active threads for new replies
+    new_thread_replies = []
+    for thread_ts, last_reply_ts in list(active_threads.items()):
+        thread_text = mcp_read_thread(token, channel_id, thread_ts)
+        if thread_text is None:
+            continue
+        replies = parse_thread_replies(thread_text, last_reply_ts)
+        for reply in replies:
+            reply["thread_ts"] = thread_ts
+            reply["thread_context"] = thread_text
+        new_thread_replies.extend(replies)
+
+    # 3. Filter
+    to_process = []
+    for msg in new_top_level:
+        if should_process(msg):
+            msg["is_thread_reply"] = False
+            to_process.append(msg)
+
+    for reply in new_thread_replies:
+        if should_process(reply):
+            reply["is_thread_reply"] = True
+            to_process.append(reply)
+
+    # Sort chronologically
+    to_process.sort(key=lambda m: float(m.get("ts", "0")))
+
+    if not to_process:
+        # Update last_checked_ts even when nothing to process
+        newest_ts = last_ts
+        for msg in new_top_level:
+            if float(msg.get("ts", "0")) > float(newest_ts):
+                newest_ts = msg["ts"]
+        if newest_ts != last_ts:
+            state["last_checked_ts"] = newest_ts
+            save_slack_state(state)
+        return
+
+    log.info(
+        "Found %d messages to process (%d top-level, %d thread replies)",
+        len(to_process),
+        sum(1 for m in to_process if not m["is_thread_reply"]),
+        sum(1 for m in to_process if m["is_thread_reply"]),
+    )
+
+    # 4. Process each message
+    replied = 0
+    for msg in to_process:
+        # Rate limit
+        allowed, remaining = _check_rate_limit()
+        if not allowed:
+            log.warning("Rate limit reached, skipping remaining messages")
+            mcp_send_message(
+                token, channel_id,
+                msg.get("thread_ts", msg["ts"]),
+                f"{AGENT_PREFIX} Rate limit reached (20/hour). Try again later.",
+            )
+            break
+
+        text = msg["text"]
+        thread_ts = msg.get("thread_ts", msg["ts"]) if msg["is_thread_reply"] else msg["ts"]
+
+        # Acknowledge receipt with eyes emoji
+        mcp_add_reaction(token, channel_id, msg["ts"], "eyes")
+
+        log.info("Processing: %.80s", text)
+
+        # Build prompt for Claude
+        if msg["is_thread_reply"]:
+            thread_context = msg.get("thread_context", "")
+            prompt = (
+                f"You are an AI assistant replying in a Slack thread. "
+                f"Here is the full thread context:\n\n{thread_context}\n\n"
+                f"The latest message is: {text}\n\n"
+                f"Respond to this latest message. Use Slack mrkdwn formatting "
+                f"(*bold*, _italic_, `code`). Be concise and helpful. "
+                f"Use all available MCP tools if needed."
+            )
+        else:
+            prompt = (
+                f"You are an AI assistant responding to a Slack message. "
+                f"The message is: {text}\n\n"
+                f"Process this as a task. Use all available MCP tools "
+                f"(Slack, Google Workspace, Glean, etc.) as needed. "
+                f"Use Slack mrkdwn formatting (*bold*, _italic_, `code`). "
+                f"Be concise and helpful."
+            )
+
+        _record_invocation()
+        response = invoke_claude(prompt, thread_id=thread_ts)
+
+        # Post reply
+        reply_text = f"{AGENT_PREFIX} {response}"
+        success = mcp_send_message(token, channel_id, thread_ts, reply_text)
+
+        if success:
+            replied += 1
+            log.info("Replied to message %s", msg["ts"])
+            # Mark done with checkmark
+            mcp_add_reaction(token, channel_id, msg["ts"], "white_check_mark")
+            # Track thread
+            active_threads[thread_ts] = msg["ts"]
+        else:
+            log.error("Failed to reply to message %s", msg["ts"])
+
+        _messages_processed += 1
+
+    # 5. Update state
+    newest_top_ts = last_ts
+    for msg in new_top_level:
+        if float(msg.get("ts", "0")) > float(newest_top_ts):
+            newest_top_ts = msg["ts"]
+    if newest_top_ts != last_ts:
+        state["last_checked_ts"] = newest_top_ts
+
+    # Update thread tracking
+    for msg in to_process:
+        if msg["is_thread_reply"]:
+            thread_ts = msg["thread_ts"]
+            active_threads[thread_ts] = msg["ts"]
+        else:
+            active_threads[msg["ts"]] = msg["ts"]
+
+    # Prune stale threads (>7 days)
+    cutoff = time.time() - 7 * 86400
+    active_threads = {
+        k: v for k, v in active_threads.items()
+        if float(v) > cutoff
+    }
+
+    state["active_threads"] = active_threads
+    save_slack_state(state)
+
+    log.info("Processed %d, replied to %d", len(to_process), replied)
+
+
+# ---------------------------------------------------------------------------
+# Unified Run Bridge
+# ---------------------------------------------------------------------------
+
+
+def run_bridge(foreground: bool = False, gmail_enabled: bool = True, slack_enabled: bool = False):
+    """Main loop: poll Gmail and/or Slack, process messages, reply."""
+    global _startup_time, _messages_processed
+    setup_logging(foreground=foreground)
+    _messages_processed = 0
+    _startup_time = datetime.now(timezone.utc)
+
+    transports = []
+    if gmail_enabled:
+        transports.append("Gmail")
+    if slack_enabled:
+        transports.append("Slack")
+    log.info("Starting ClaudeRemote (%s)", " + ".join(transports))
+    if slack_enabled and BUSINESS_HOURS_ONLY:
+        log.info("Slack business hours: %d:00 - %d:00", BUSINESS_HOURS_START, BUSINESS_HOURS_END)
+
+    # --- Gmail init ---
+    service = None
+    my_email = None
+    processed_ids = None
+    thread_sessions = None
+    startup_time_ms = None
+
+    if gmail_enabled:
+        try:
+            service = authenticate()
+            my_email = get_my_email(service)
+            log.info("Gmail authenticated as %s", my_email)
+            processed_ids = load_processed_ids()
+            thread_sessions = load_thread_sessions()
+            startup_time_ms = int(time.time() * 1000)
+            log.info("Loaded %d processed IDs, %d thread sessions", len(processed_ids), len(thread_sessions))
+        except Exception as e:
+            log.error("Gmail authentication failed: %s", e)
+            if not slack_enabled:
+                print(f"Gmail authentication failed: {e}", file=sys.stderr)
+                sys.exit(1)
+            else:
+                log.warning("Continuing with Slack only (Gmail init failed)")
+                gmail_enabled = False
+
+    # --- Slack init ---
+    slack_token = None
+    slack_state = None
+
+    if slack_enabled:
+        try:
+            slack_token = get_slack_token()
+            if not slack_token:
+                raise RuntimeError(
+                    "No valid Slack MCP token found. "
+                    "Run any Slack MCP tool in Claude Code first to authenticate."
+                )
+            log.info("Slack MCP token loaded successfully")
+            slack_state = load_slack_state()
+            if not slack_state["channel_id"]:
+                raise RuntimeError(
+                    "No channel_id in state file. "
+                    "Run /check-slack in Claude Code first to initialize."
+                )
+            if not slack_state["last_checked_ts"]:
+                slack_state["last_checked_ts"] = f"{time.time():.6f}"
+                save_slack_state(slack_state)
+                log.info("Slack first run - initialized timestamp")
+            log.info(
+                "Watching #%s (%s), %d active threads",
+                slack_state["channel_name"],
+                slack_state["channel_id"],
+                len(slack_state.get("active_threads", {})),
+            )
+        except Exception as e:
+            log.error("Slack init failed: %s", e)
+            if not gmail_enabled:
+                print(f"Slack init failed: {e}", file=sys.stderr)
+                sys.exit(1)
+            else:
+                log.warning("Continuing with Gmail only (Slack init failed)")
+                slack_enabled = False
+
+    if not gmail_enabled and not slack_enabled:
+        print("Error: No transport could be initialized.", file=sys.stderr)
+        sys.exit(1)
+
+    log.info("Startup time: %s", _startup_time.isoformat())
+
+    # Graceful shutdown
+    running = True
+
+    def handle_signal(signum, frame):
+        nonlocal running
+        log.info("Received signal %d, shutting down...", signum)
+        running = False
+
+    signal.signal(signal.SIGINT, handle_signal)
+    signal.signal(signal.SIGTERM, handle_signal)
+
+    while running:
+        # --- Slack poll ---
+        if slack_enabled:
+            if not is_business_hours():
+                log.debug("Outside business hours, skipping Slack poll")
+            else:
+                try:
+                    # Re-read token each cycle in case Claude Code refreshed it
+                    slack_token = get_slack_token()
+                    if not slack_token:
+                        log.warning("Slack token expired or missing")
+                    else:
+                        slack_state = load_slack_state()
+                        slack_poll_cycle(slack_token, slack_state)
+                except Exception:
+                    log.exception("Error in Slack poll cycle")
+
+        # --- Gmail poll ---
+        if gmail_enabled:
+            try:
+                log.info("Starting Gmail poll cycle")
+                gmail_poll_cycle(service, my_email, processed_ids, thread_sessions, startup_time_ms)
+                log.info("Gmail poll cycle complete")
+            except Exception:
+                log.exception("Error in Gmail poll cycle")
+                # Re-authenticate in case token issues
+                try:
+                    service = authenticate()
+                except Exception:
+                    log.exception("Gmail re-authentication failed")
+
+        # Sleep in small increments so we respond to signals
+        for _ in range(POLL_INTERVAL):
+            if not running:
+                break
+            time.sleep(1)
+
+    log.info("ClaudeRemote stopped")
+
+
+# ---------------------------------------------------------------------------
 # Daemon Management
 # ---------------------------------------------------------------------------
 
@@ -1080,7 +1670,7 @@ def _find_bridge_pids():
         return []
     pids = []
     for line in out.splitlines():
-        if "bridge.py" not in line or "slack_bridge" in line:
+        if "bridge.py" not in line or "slack_bridge" in line or "slack_mcp_bridge" in line:
             continue
         parts = line.split()
         try:
@@ -1093,86 +1683,47 @@ def _find_bridge_pids():
     return pids
 
 
-def start_daemon():
-    """Start the bridge as a background process.
-
-    Uses fcntl.flock() on LOCK_FILE to guarantee at most one daemon runs.
-    The lock is acquired before forking and the fd is inherited by the
-    grandchild, so there is no race window where a second instance can
-    slip through.
-    """
-    # Kill any orphan bridge processes before attempting to start.
-    orphans = _find_bridge_pids()
-    for pid in orphans:
-        try:
-            os.kill(pid, signal.SIGTERM)
-        except OSError:
-            pass
-    if orphans:
-        time.sleep(0.5)
-        for pid in orphans:
-            if _pid_alive(pid):
-                try:
-                    os.kill(pid, signal.SIGKILL)
-                except OSError:
-                    pass
-
-    LOCK_FILE.touch(exist_ok=True)
-    lock_fd = open(LOCK_FILE, "r+")
-    try:
-        fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except BlockingIOError:
-        lock_fd.close()
-        pid = PID_FILE.read_text().strip() if PID_FILE.exists() else "unknown"
-        print(f"Bridge already running (PID {pid})")
+def start_daemon(gmail_enabled: bool = True, slack_enabled: bool = False):
+    """Start the bridge as a background subprocess."""
+    # Check if already running
+    pids = _find_bridge_pids()
+    if pids:
+        print(f"Bridge already running (PIDs {pids})")
         return
 
-    # Lock acquired — clean stale PID file.
-    if PID_FILE.exists():
-        PID_FILE.unlink()
+    # Build the run command with transport flags
+    cmd = [sys.executable, __file__, "run"]
+    if gmail_enabled and slack_enabled:
+        cmd.append("--all")
+    elif slack_enabled:
+        cmd.append("--slack")
+    else:
+        cmd.append("--gmail")
 
-    # Fork into background. Child inherits lock_fd.
-    pid = os.fork()
-    if pid > 0:
-        lock_fd.close()
-        print(f"Bridge started (PID {pid})")
-        print(f"Logs: {LOG_FILE}")
-        return
+    # Launch as a detached subprocess
+    proc = subprocess.Popen(
+        cmd,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+    PID_FILE.write_text(str(proc.pid))
 
-    # Child: become session leader.
-    os.setsid()
-
-    # Second fork to fully detach. Grandchild inherits lock_fd.
-    pid = os.fork()
-    if pid > 0:
-        os._exit(0)
-
-    # Grandchild — the actual daemon.
-    # Keep lock_fd open: flock is per open-file-description, so the lock
-    # stays held as long as ANY fd referencing that description is open.
-
-    # Redirect stdio.
-    sys.stdin.close()
-    sys.stdout = open(os.devnull, "w")
-    sys.stderr = open(os.devnull, "w")
-
-    # Write PID file.
-    PID_FILE.write_text(str(os.getpid()))
-
-    try:
-        run_bridge(foreground=False)
-    finally:
-        if PID_FILE.exists():
-            PID_FILE.unlink()
-        lock_fd.close()
+    transports = []
+    if gmail_enabled:
+        transports.append("Gmail")
+    if slack_enabled:
+        transports.append("Slack")
+    print(f"Bridge started (PID {proc.pid}) [{' + '.join(transports)}]")
+    print(f"  Poll interval: {POLL_INTERVAL}s")
+    if slack_enabled and BUSINESS_HOURS_ONLY:
+        print(f"  Slack business hours: {BUSINESS_HOURS_START}:00 - {BUSINESS_HOURS_END}:00")
+    print(f"  Logs: {LOG_FILE}")
 
 
 def stop_daemon():
-    """Stop all running bridge daemon(s).
-
-    Uses both PID file and pgrep to find processes, ensuring orphans
-    are killed too. Falls back to SIGKILL if SIGTERM doesn't work.
-    """
+    """Stop all running bridge daemon(s)."""
     pids = set(_find_bridge_pids())
     if PID_FILE.exists():
         try:
@@ -1213,29 +1764,131 @@ def stop_daemon():
         PID_FILE.unlink()
 
 
+def show_status():
+    """Show bridge status including both transports."""
+    pids = _find_bridge_pids()
+    if pids:
+        print(f"Bridge is running (PIDs {pids})")
+    else:
+        if PID_FILE.exists():
+            file_pid = PID_FILE.read_text().strip()
+            if _pid_alive(int(file_pid)):
+                print(f"Bridge is running (PID {file_pid})")
+            else:
+                print("Bridge is not running (stale PID file)")
+        else:
+            print("Bridge is not running")
+
+    # Gmail status
+    print("\n[Gmail]")
+    if TOKEN_FILE.exists():
+        print("  Token: present")
+    else:
+        print("  Token: not configured")
+    if GMAIL_PROCESSED_FILE.exists():
+        count = len(GMAIL_PROCESSED_FILE.read_text().strip().splitlines())
+        print(f"  Processed messages: {count}")
+    if SESSIONS_FILE.exists():
+        try:
+            sessions = json.loads(SESSIONS_FILE.read_text())
+            print(f"  Active threads: {len(sessions)}")
+        except (json.JSONDecodeError, ValueError):
+            pass
+
+    # Slack status
+    print("\n[Slack MCP]")
+    slack_state = load_slack_state()
+    print(f"  Channel: #{slack_state.get('channel_name', '?')} ({slack_state.get('channel_id', '?')})")
+    print(f"  Last checked: {slack_state.get('last_checked_ts', 'never')}")
+    print(f"  Active threads: {len(slack_state.get('active_threads', {}))}")
+
+    token = get_slack_token()
+    if token:
+        creds = _load_credentials()
+        entry = _find_slack_token_entry(creds)
+        if entry:
+            expires = entry.get("expiresAt", 0)
+            if expires:
+                exp_dt = datetime.fromtimestamp(expires / 1000)
+                remaining = exp_dt - datetime.now()
+                print(f"  Token expires: {exp_dt.isoformat()} ({remaining})")
+    else:
+        print("  Token: MISSING or EXPIRED")
+
+
 # ---------------------------------------------------------------------------
 # Entry Point
 # ---------------------------------------------------------------------------
 
 
+def _parse_transport_flags(args) -> tuple:
+    """Parse --gmail, --slack, --all flags. Returns (gmail_enabled, slack_enabled)."""
+    if args.all:
+        return True, True
+    if args.slack and not args.gmail:
+        return False, True
+    if args.gmail and not args.slack:
+        return True, False
+    # Default: --gmail only (backward compatible)
+    if not args.gmail and not args.slack:
+        return True, False
+    return args.gmail, args.slack
+
+
 def main():
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
 
-    if len(sys.argv) < 2:
-        print(__doc__)
+    parser = argparse.ArgumentParser(
+        description="ClaudeRemote: unified Gmail + Slack remote interface for Claude Code.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "Examples:\n"
+            "  %(prog)s run --gmail       # Gmail only (default)\n"
+            "  %(prog)s run --slack       # Slack MCP only\n"
+            "  %(prog)s run --all         # Both Gmail + Slack\n"
+            "  %(prog)s start --all       # Daemon with both transports\n"
+            "  %(prog)s stop              # Stop daemon\n"
+            "  %(prog)s status            # Show status\n"
+        ),
+    )
+    subparsers = parser.add_subparsers(dest="command", help="Command to run")
+
+    # run subcommand
+    run_parser = subparsers.add_parser("run", help="Run in foreground")
+    run_parser.add_argument("--gmail", action="store_true", help="Enable Gmail transport")
+    run_parser.add_argument("--slack", action="store_true", help="Enable Slack MCP transport")
+    run_parser.add_argument("--all", action="store_true", help="Enable both Gmail + Slack")
+
+    # start subcommand
+    start_parser = subparsers.add_parser("start", help="Start as background daemon")
+    start_parser.add_argument("--gmail", action="store_true", help="Enable Gmail transport")
+    start_parser.add_argument("--slack", action="store_true", help="Enable Slack MCP transport")
+    start_parser.add_argument("--all", action="store_true", help="Enable both Gmail + Slack")
+
+    # stop subcommand
+    subparsers.add_parser("stop", help="Stop daemon")
+
+    # status subcommand
+    subparsers.add_parser("status", help="Show bridge status")
+
+    args = parser.parse_args()
+
+    if not args.command:
+        parser.print_help()
         sys.exit(1)
 
-    command = sys.argv[1]
-
-    if command == "start":
-        start_daemon()
-    elif command == "stop":
+    if args.command == "run":
+        gmail_enabled, slack_enabled = _parse_transport_flags(args)
+        run_bridge(foreground=True, gmail_enabled=gmail_enabled, slack_enabled=slack_enabled)
+    elif args.command == "start":
+        gmail_enabled, slack_enabled = _parse_transport_flags(args)
+        start_daemon(gmail_enabled=gmail_enabled, slack_enabled=slack_enabled)
+    elif args.command == "stop":
         stop_daemon()
-    elif command == "run":
-        run_bridge(foreground=True)
+    elif args.command == "status":
+        show_status()
     else:
-        print(f"Unknown command: {command}")
-        print(__doc__)
+        parser.print_help()
         sys.exit(1)
 
 

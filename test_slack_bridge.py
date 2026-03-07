@@ -1,4 +1,5 @@
-"""Unit tests for ClaudeRemote Slack Bridge."""
+"""Unit tests for ClaudeRemote Slack Bridge (now part of unified bridge module)."""
+from __future__ import annotations
 
 import json
 import os
@@ -9,7 +10,7 @@ from unittest import mock
 
 import pytest
 
-import slack_bridge
+import bridge
 
 
 # ---------------------------------------------------------------------------
@@ -21,129 +22,112 @@ import slack_bridge
 def tmp_config(tmp_path):
     """Override config paths to use a temp directory."""
     with mock.patch.multiple(
-        slack_bridge,
+        bridge,
         CONFIG_DIR=tmp_path,
-        PROCESSED_FILE=tmp_path / "slack_processed.txt",
-        SESSIONS_FILE=tmp_path / "slack_sessions.json",
-        PID_FILE=tmp_path / "slack_bridge.pid",
-        LOG_FILE=tmp_path / "slack_bridge.log",
-        RATE_LIMIT_FILE=tmp_path / "slack_rate_limit.json",
-        CANCEL_FILE=tmp_path / "slack_cancel.txt",
-        SLACK_TOKEN_FILE=tmp_path / "slack_token.txt",
+        GMAIL_PROCESSED_FILE=tmp_path / "processed.txt",
+        SESSIONS_FILE=tmp_path / "thread_sessions.json",
+        PID_FILE=tmp_path / "bridge.pid",
+        LOG_FILE=tmp_path / "bridge.log",
+        RATE_LIMIT_FILE=tmp_path / "rate_limit.json",
+        CANCEL_FILE=tmp_path / "cancel.txt",
+        SLACK_STATE_FILE=tmp_path / "slack_agent_state.json",
+        CREDENTIALS_FILE=tmp_path / "credentials.json",
     ):
         yield tmp_path
 
 
 # ---------------------------------------------------------------------------
-# Message detection
+# Slack message parsing and filtering
 # ---------------------------------------------------------------------------
 
 
-class TestMessageDetection:
-    """Tests for bot mention detection and message filtering."""
+class TestSlackMessageParsing:
+    """Tests for MCP-based message parsing."""
 
-    def test_bot_mention_detected(self):
-        msg = {"text": "Hey <@U12345BOT> can you help?"}
-        assert slack_bridge.is_bot_mention(msg, "U12345BOT") is True
-
-    def test_no_mention_ignored(self):
-        msg = {"text": "Just a regular message"}
-        assert slack_bridge.is_bot_mention(msg, "U12345BOT") is False
-
-    def test_wrong_user_mention_ignored(self):
-        msg = {"text": "Hey <@UOTHER> can you help?"}
-        assert slack_bridge.is_bot_mention(msg, "U12345BOT") is False
-
-    def test_empty_message_ignored(self):
-        msg = {"text": ""}
-        assert slack_bridge.is_bot_mention(msg, "U12345BOT") is False
-
-    def test_missing_text_field(self):
-        msg = {}
-        assert slack_bridge.is_bot_mention(msg, "U12345BOT") is False
-
-    def test_skip_bot_own_messages(self):
-        """Bot must skip messages from itself."""
-        msg = {"user": "U12345BOT", "text": "I am the bot"}
-        assert msg.get("user") == "U12345BOT"
-
-    def test_skip_other_bot_messages(self):
-        """Messages with bot_id should be skipped."""
-        msg = {"bot_id": "B123", "text": "Other bot"}
-        assert msg.get("bot_id") is not None
-
-    def test_skip_bot_subtype(self):
-        """Messages with subtype=bot_message should be skipped."""
-        msg = {"subtype": "bot_message", "text": "Bot msg"}
-        assert msg.get("subtype") == "bot_message"
-
-
-# ---------------------------------------------------------------------------
-# Strip bot mention
-# ---------------------------------------------------------------------------
-
-
-class TestStripBotMention:
-    """Tests for removing bot mention from message text."""
-
-    def test_mention_at_start(self):
-        result = slack_bridge.strip_bot_mention("<@U123> hello world", "U123")
-        assert result == "hello world"
-
-    def test_mention_in_middle(self):
-        result = slack_bridge.strip_bot_mention("hey <@U123> do this", "U123")
-        assert result == "hey  do this"
-
-    def test_no_mention(self):
-        result = slack_bridge.strip_bot_mention("hello world", "U123")
-        assert result == "hello world"
-
-    def test_mention_only(self):
-        result = slack_bridge.strip_bot_mention("<@U123>", "U123")
-        assert result == ""
-
-    def test_mention_with_extra_whitespace(self):
-        result = slack_bridge.strip_bot_mention("  <@U123>   hello  ", "U123")
-        assert result == "hello"
-
-
-# ---------------------------------------------------------------------------
-# Command parsing
-# ---------------------------------------------------------------------------
-
-
-class TestCommandParsing:
-    """Built-in commands must be recognized from message text."""
-
-    def test_help_command(self):
-        body = slack_bridge.strip_bot_mention("<@U123> /help", "U123")
-        assert body.lower() == "/help"
-
-    def test_status_command(self):
-        body = slack_bridge.strip_bot_mention("<@U123> /status", "U123")
-        assert body.lower() == "/status"
-
-    def test_sessions_command(self):
-        body = slack_bridge.strip_bot_mention("<@U123> /sessions", "U123")
-        assert body.lower() == "/sessions"
-
-    def test_cancel_command(self):
-        body = slack_bridge.strip_bot_mention("<@U123> /cancel", "U123")
-        assert body.lower() == "/cancel"
-
-    def test_resume_command(self):
-        body = slack_bridge.strip_bot_mention(
-            "<@U123> /resume abc-123-def", "U123"
+    def test_parse_new_messages_basic(self):
+        channel_text = (
+            "=== Message from user1 (U123)\n"
+            "Message TS: 1000.001\n"
+            "Hello world\n"
+            "\n"
+            "=== Message from user2 (U456)\n"
+            "Message TS: 1000.002\n"
+            "Second message\n"
         )
-        assert body.lower().startswith("/resume ")
-        resume_id = body.split(None, 1)[1].strip()
-        assert resume_id == "abc-123-def"
+        messages = bridge.parse_new_messages(channel_text, "999.000")
+        assert len(messages) == 2
+        assert messages[0]["user"] == "U123"
+        assert messages[0]["ts"] == "1000.001"
+        assert messages[1]["user"] == "U456"
 
-    def test_regular_message_not_command(self):
-        body = slack_bridge.strip_bot_mention(
-            "<@U123> what time is it?", "U123"
+    def test_parse_new_messages_filters_old(self):
+        channel_text = (
+            "=== Message from user1 (U123)\n"
+            "Message TS: 900.001\n"
+            "Old message\n"
+            "\n"
+            "=== Message from user2 (U456)\n"
+            "Message TS: 1100.002\n"
+            "New message\n"
         )
-        assert not body.startswith("/")
+        messages = bridge.parse_new_messages(channel_text, "1000.000")
+        assert len(messages) == 1
+        assert messages[0]["ts"] == "1100.002"
+
+    def test_parse_thread_replies_basic(self):
+        thread_text = (
+            "=== Original message ===\n"
+            "Some original\n"
+            "\n"
+            "THREAD REPLIES\n"
+            "\n"
+            "--- Reply 1 ---\n"
+            "From: user1 (U123)\n"
+            "Message TS: 1000.005\n"
+            "Reply text here\n"
+        )
+        replies = bridge.parse_thread_replies(thread_text, "999.000")
+        assert len(replies) == 1
+        assert replies[0]["user"] == "U123"
+        assert "Reply text here" in replies[0]["text"]
+
+    def test_parse_thread_replies_filters_old(self):
+        thread_text = (
+            "THREAD REPLIES\n"
+            "--- Reply 1 ---\n"
+            "From: user1 (U123)\n"
+            "Message TS: 900.005\n"
+            "Old reply\n"
+            "--- Reply 2 ---\n"
+            "From: user2 (U456)\n"
+            "Message TS: 1100.005\n"
+            "New reply\n"
+        )
+        replies = bridge.parse_thread_replies(thread_text, "1000.000")
+        assert len(replies) == 1
+        assert replies[0]["ts"] == "1100.005"
+
+
+class TestShouldProcess:
+    """Tests for should_process filter."""
+
+    def test_normal_message(self):
+        assert bridge.should_process({"text": "hello"}) is True
+
+    def test_agent_prefix_skipped(self):
+        assert bridge.should_process({"text": f"{bridge.AGENT_PREFIX} response"}) is False
+
+    def test_empty_skipped(self):
+        assert bridge.should_process({"text": ""}) is False
+
+    def test_whitespace_skipped(self):
+        assert bridge.should_process({"text": "   "}) is False
+
+    def test_join_message_skipped(self):
+        assert bridge.should_process({"text": "user has joined the channel"}) is False
+
+    def test_claude_sent_skipped(self):
+        assert bridge.should_process({"text": "Sent using Claude"}) is False
 
 
 # ---------------------------------------------------------------------------
@@ -155,13 +139,13 @@ class TestRateLimiting:
     """Tests for rate limiting Claude invocations."""
 
     def test_allowed_when_empty(self, tmp_config):
-        allowed, remaining = slack_bridge._check_rate_limit()
+        allowed, remaining = bridge._check_rate_limit()
         assert allowed is True
         assert remaining == 20
 
     def test_allowed_after_one_invocation(self, tmp_config):
-        slack_bridge._record_invocation()
-        allowed, remaining = slack_bridge._check_rate_limit()
+        bridge._record_invocation()
+        allowed, remaining = bridge._check_rate_limit()
         assert allowed is True
         assert remaining == 19
 
@@ -169,9 +153,9 @@ class TestRateLimiting:
         """Should be blocked after 20 invocations in an hour."""
         now = time.time()
         timestamps = [now - i for i in range(20)]
-        slack_bridge.RATE_LIMIT_FILE.write_text(json.dumps(timestamps))
+        bridge.RATE_LIMIT_FILE.write_text(json.dumps(timestamps))
 
-        allowed, remaining = slack_bridge._check_rate_limit()
+        allowed, remaining = bridge._check_rate_limit()
         assert allowed is False
         assert remaining == 0
 
@@ -179,134 +163,167 @@ class TestRateLimiting:
         """Entries older than 1 hour should be pruned."""
         now = time.time()
         old_timestamps = [now - 3700 for _ in range(20)]
-        slack_bridge.RATE_LIMIT_FILE.write_text(json.dumps(old_timestamps))
+        bridge.RATE_LIMIT_FILE.write_text(json.dumps(old_timestamps))
 
-        allowed, remaining = slack_bridge._check_rate_limit()
+        allowed, remaining = bridge._check_rate_limit()
         assert allowed is True
         assert remaining == 20
 
     def test_corrupt_json_handled(self, tmp_config):
-        slack_bridge.RATE_LIMIT_FILE.write_text("not json")
-        allowed, remaining = slack_bridge._check_rate_limit()
+        bridge.RATE_LIMIT_FILE.write_text("not json")
+        allowed, remaining = bridge._check_rate_limit()
         assert allowed is True
         assert remaining == 20
 
 
 # ---------------------------------------------------------------------------
-# Thread session management
+# Slack state management
 # ---------------------------------------------------------------------------
 
 
-class TestThreadSessions:
-    """Tests for thread_ts -> session_id mapping."""
+class TestSlackState:
+    """Tests for Slack state file management."""
 
-    def test_empty_sessions(self, tmp_config):
-        assert slack_bridge.load_thread_sessions() == {}
+    def test_empty_state(self, tmp_config):
+        state = bridge.load_slack_state()
+        assert state["channel_id"] == ""
+        assert state["active_threads"] == {}
 
-    def test_sessions_roundtrip(self, tmp_config):
-        sessions = {"1234567890.123456": "session-a", "1234567890.654321": "session-b"}
-        slack_bridge.save_thread_sessions(sessions)
-        loaded = slack_bridge.load_thread_sessions()
-        assert loaded == sessions
+    def test_state_roundtrip(self, tmp_config):
+        state = {
+            "channel_id": "C123",
+            "channel_name": "test",
+            "last_checked_ts": "1000.0",
+            "active_threads": {"1000.1": "1000.2"},
+        }
+        bridge.save_slack_state(state)
+        loaded = bridge.load_slack_state()
+        assert loaded["channel_id"] == "C123"
+        assert loaded["active_threads"]["1000.1"] == "1000.2"
 
-    def test_corrupt_json_returns_empty(self, tmp_config):
-        slack_bridge.SESSIONS_FILE.write_text("not json")
-        assert slack_bridge.load_thread_sessions() == {}
-
-
-# ---------------------------------------------------------------------------
-# Processed IDs
-# ---------------------------------------------------------------------------
-
-
-class TestProcessedIds:
-    """Tests for processed message tracking."""
-
-    def test_empty_processed(self, tmp_config):
-        assert slack_bridge.load_processed_ids() == set()
-
-    def test_roundtrip(self, tmp_config):
-        slack_bridge.save_processed_id("1234.5678")
-        slack_bridge.save_processed_id("9876.5432")
-        ids = slack_bridge.load_processed_ids()
-        assert ids == {"1234.5678", "9876.5432"}
-
-    def test_deduplication(self, tmp_config):
-        slack_bridge.save_processed_id("1234.5678")
-        slack_bridge.save_processed_id("1234.5678")
-        ids = slack_bridge.load_processed_ids()
-        assert ids == {"1234.5678"}
+    def test_corrupt_json_returns_default(self, tmp_config):
+        bridge.SLACK_STATE_FILE.write_text("not json")
+        state = bridge.load_slack_state()
+        assert state["channel_id"] == ""
 
 
 # ---------------------------------------------------------------------------
-# Build thread context
+# Token management
 # ---------------------------------------------------------------------------
 
 
-class TestBuildThreadContext:
-    """Tests for formatting thread messages as context."""
+class TestTokenManagement:
+    """Tests for Slack MCP token loading."""
 
-    def test_single_user_message(self):
-        msgs = [{"user": "U_USER", "text": "hello", "ts": "1234.5678"}]
-        ctx = slack_bridge.build_thread_context(msgs, "U_BOT")
-        assert "[User -- ts:1234.5678]" in ctx
-        assert "hello" in ctx
+    def test_missing_credentials_file(self, tmp_config):
+        result = bridge._load_credentials()
+        assert result == {}
 
-    def test_bot_reply_labeled(self):
-        msgs = [
-            {"user": "U_USER", "text": "question", "ts": "1234.5678"},
-            {"user": "U_BOT", "text": "answer", "ts": "1234.5679"},
-        ]
-        ctx = slack_bridge.build_thread_context(msgs, "U_BOT")
-        assert "You (Claude, in a previous reply)" in ctx
+    def test_find_token_entry_found(self):
+        creds = {
+            "mcpOAuth": {
+                "slack-mcp-key": {
+                    "serverUrl": "https://mcp.slack.com/mcp",
+                    "accessToken": "xoxe.xoxp-test-token",
+                    "expiresAt": int(time.time() * 1000) + 3600000,
+                }
+            }
+        }
+        entry = bridge._find_slack_token_entry(creds)
+        assert entry is not None
+        assert entry["accessToken"] == "xoxe.xoxp-test-token"
 
-    def test_empty_text_skipped(self):
-        msgs = [{"user": "U_USER", "text": "", "ts": "1234.5678"}]
-        ctx = slack_bridge.build_thread_context(msgs, "U_BOT")
-        assert ctx == ""
+    def test_find_token_entry_not_found(self):
+        creds = {"mcpOAuth": {"other-key": {"serverUrl": "https://example.com", "accessToken": "abc"}}}
+        entry = bridge._find_slack_token_entry(creds)
+        assert entry is None
+
+    def test_expired_token_returns_none(self, tmp_config):
+        creds = {
+            "mcpOAuth": {
+                "slack-mcp-key": {
+                    "serverUrl": "https://mcp.slack.com/mcp",
+                    "accessToken": "xoxe.xoxp-test-token",
+                    "expiresAt": int(time.time() * 1000) - 3600000,
+                }
+            }
+        }
+        bridge.CREDENTIALS_FILE.write_text(json.dumps(creds))
+        token = bridge.get_slack_token()
+        assert token is None
+
+    def test_valid_token_returned(self, tmp_config):
+        creds = {
+            "mcpOAuth": {
+                "slack-mcp-key": {
+                    "serverUrl": "https://mcp.slack.com/mcp",
+                    "accessToken": "xoxe.xoxp-valid-token",
+                    "expiresAt": int(time.time() * 1000) + 3600000,
+                }
+            }
+        }
+        bridge.CREDENTIALS_FILE.write_text(json.dumps(creds))
+        token = bridge.get_slack_token()
+        assert token == "xoxe.xoxp-valid-token"
 
 
 # ---------------------------------------------------------------------------
-# Authentication
+# MCP text extraction
 # ---------------------------------------------------------------------------
 
 
-class TestAuthentication:
-    """Tests for Slack token authentication."""
+class TestMcpTextExtraction:
+    """Tests for extracting text from MCP responses."""
 
-    def test_missing_token_file_exits(self, tmp_config):
-        with pytest.raises(SystemExit):
-            slack_bridge.authenticate()
+    def test_extract_with_messages_key(self):
+        result = {
+            "content": [
+                {"type": "text", "text": json.dumps({"messages": "Hello world"})}
+            ]
+        }
+        assert bridge._extract_mcp_text(result) == "Hello world"
 
-    def test_invalid_token_prefix_exits(self, tmp_config):
-        slack_bridge.SLACK_TOKEN_FILE.write_text("invalid-token-here")
-        with pytest.raises(SystemExit):
-            slack_bridge.authenticate()
+    def test_extract_raw_fallback(self):
+        result = {
+            "content": [
+                {"type": "text", "text": "plain text"}
+            ]
+        }
+        assert bridge._extract_mcp_text(result) == "plain text"
 
-    def test_valid_token_creates_client(self, tmp_config):
-        slack_bridge.SLACK_TOKEN_FILE.write_text("xoxb-fake-token-12345")
-        client = slack_bridge.authenticate()
-        assert client is not None
+    def test_extract_none_for_empty(self):
+        assert bridge._extract_mcp_text({}) is None
+
+    def test_extract_none_for_none(self):
+        assert bridge._extract_mcp_text(None) is None
+
+    def test_extract_none_for_no_text_type(self):
+        result = {"content": [{"type": "image", "data": "abc"}]}
+        assert bridge._extract_mcp_text(result) is None
 
 
 # ---------------------------------------------------------------------------
-# Help text
+# Cancel support
 # ---------------------------------------------------------------------------
 
 
-class TestHelpText:
-    """Verify HELP_TEXT contains key commands."""
+class TestCancelSupport:
+    """Tests for the cancel mechanism."""
 
-    def test_help_text_contains_commands(self):
-        assert "/help" in slack_bridge.HELP_TEXT
-        assert "/status" in slack_bridge.HELP_TEXT
-        assert "/sessions" in slack_bridge.HELP_TEXT
-        assert "/resume" in slack_bridge.HELP_TEXT
-        assert "/cancel" in slack_bridge.HELP_TEXT
+    def test_check_cancel_no_file(self, tmp_config):
+        assert bridge._check_cancel("thread-1") is False
 
-    def test_help_text_contains_capabilities(self):
-        assert "Multi-turn" in slack_bridge.HELP_TEXT
-        assert "Mention the bot" in slack_bridge.HELP_TEXT
+    def test_check_cancel_thread_found(self, tmp_config):
+        bridge.CANCEL_FILE.write_text("thread-1\n")
+        assert bridge._check_cancel("thread-1") is True
+        # Should be removed after checking
+        if bridge.CANCEL_FILE.exists():
+            content = bridge.CANCEL_FILE.read_text()
+            assert "thread-1" not in content
+
+    def test_check_cancel_thread_not_found(self, tmp_config):
+        bridge.CANCEL_FILE.write_text("thread-2\n")
+        assert bridge._check_cancel("thread-1") is False
 
 
 # ---------------------------------------------------------------------------
@@ -320,17 +337,17 @@ class TestInvokeClaudeErrors:
     def test_timeout_message_has_recovery_steps(self):
         with mock.patch("subprocess.Popen") as mock_popen:
             proc = mock.MagicMock()
-            proc.poll.return_value = None  # never finishes
+            proc.poll.return_value = None
             mock_popen.return_value = proc
-            with mock.patch.object(slack_bridge, "CLAUDE_TIMEOUT", 2):
+            with mock.patch.object(bridge, "CLAUDE_TIMEOUT", 2):
                 with mock.patch("time.sleep"):
-                    result = slack_bridge.invoke_claude("hi", "sess-1")
+                    result = bridge.invoke_claude("hi", "sess-1")
         assert "Timed out" in result
         assert "/resume" in result
 
     def test_command_not_found_message(self):
         with mock.patch("subprocess.Popen", side_effect=FileNotFoundError):
-            result = slack_bridge.invoke_claude("hi", "sess-3")
+            result = bridge.invoke_claude("hi", "sess-3")
         assert "not found" in result
         assert "npm install" in result
 
@@ -343,32 +360,37 @@ class TestInvokeClaudeErrors:
             proc.returncode = 0
             mock_popen.return_value = proc
             with mock.patch("time.sleep"):
-                result = slack_bridge.invoke_claude("hi", "sess-4")
+                result = bridge.invoke_claude("hi", "sess-4")
         assert "empty output" in result.lower()
 
 
 # ---------------------------------------------------------------------------
-# Cancel support
+# Business hours
 # ---------------------------------------------------------------------------
 
 
-class TestCancelSupport:
-    """Tests for the cancel mechanism."""
+class TestBusinessHours:
+    """Tests for business hours gating."""
 
-    def test_check_cancel_no_file(self, tmp_config):
-        assert slack_bridge._check_cancel("thread-1") is False
+    def test_disabled_always_true(self):
+        with mock.patch.object(bridge, "BUSINESS_HOURS_ONLY", False):
+            assert bridge.is_business_hours() is True
 
-    def test_check_cancel_thread_found(self, tmp_config):
-        slack_bridge.CANCEL_FILE.write_text("thread-1\n")
-        assert slack_bridge._check_cancel("thread-1") is True
-        # Should be removed after checking
-        if slack_bridge.CANCEL_FILE.exists():
-            content = slack_bridge.CANCEL_FILE.read_text()
-            assert "thread-1" not in content
+    def test_within_hours(self):
+        with mock.patch.object(bridge, "BUSINESS_HOURS_ONLY", True), \
+             mock.patch.object(bridge, "BUSINESS_HOURS_START", 8), \
+             mock.patch.object(bridge, "BUSINESS_HOURS_END", 22):
+            with mock.patch("bridge.datetime") as mock_dt:
+                mock_dt.now.return_value = datetime(2026, 3, 7, 12, 0, 0)
+                assert bridge.is_business_hours() is True
 
-    def test_check_cancel_thread_not_found(self, tmp_config):
-        slack_bridge.CANCEL_FILE.write_text("thread-2\n")
-        assert slack_bridge._check_cancel("thread-1") is False
+    def test_outside_hours(self):
+        with mock.patch.object(bridge, "BUSINESS_HOURS_ONLY", True), \
+             mock.patch.object(bridge, "BUSINESS_HOURS_START", 8), \
+             mock.patch.object(bridge, "BUSINESS_HOURS_END", 22):
+            with mock.patch("bridge.datetime") as mock_dt:
+                mock_dt.now.return_value = datetime(2026, 3, 7, 3, 0, 0)
+                assert bridge.is_business_hours() is False
 
 
 if __name__ == "__main__":

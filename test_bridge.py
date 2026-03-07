@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Unit tests for ClaudeRemote bridge."""
+from __future__ import annotations
 
 import base64
 import email.utils
@@ -28,13 +29,14 @@ def tmp_config(tmp_path):
     with mock.patch.multiple(
         bridge,
         CONFIG_DIR=tmp_path,
-        PROCESSED_FILE=tmp_path / "processed.txt",
+        GMAIL_PROCESSED_FILE=tmp_path / "processed.txt",
         SESSIONS_FILE=tmp_path / "thread_sessions.json",
         PID_FILE=tmp_path / "bridge.pid",
         LOG_FILE=tmp_path / "bridge.log",
         ATTACHMENTS_DIR=tmp_path / "attachments",
         DIGEST_LAST_SENT_FILE=tmp_path / "digest_last_sent.txt",
         RATE_LIMIT_FILE=tmp_path / "rate_limit.json",
+        SUMMARY_LAST_SENT_FILE=tmp_path / "summary_last_sent.txt",
     ):
         yield tmp_path
 
@@ -115,7 +117,7 @@ class TestSelfReplyDetection:
         assert sender_email == "user@example.com"
 
     def test_accept_plain_email(self):
-        """No display name — should not be treated as bot."""
+        """No display name - should not be treated as bot."""
         sender_name, sender_email = email.utils.parseaddr(
             "user@example.com"
         )
@@ -274,7 +276,7 @@ class TestOutputTruncation:
         long_text = "x" * (bridge.MAX_RESPONSE_LEN + 100)
         # Simulate what invoke_claude does
         if len(long_text) > bridge.MAX_RESPONSE_LEN:
-            result = long_text[:bridge.MAX_RESPONSE_LEN] + "\n\n[truncated — response exceeded 50K chars]"
+            result = long_text[:bridge.MAX_RESPONSE_LEN] + "\n\n[truncated -- response exceeded 50K chars]"
         assert len(result) > bridge.MAX_RESPONSE_LEN
         assert "[truncated" in result
 
@@ -561,6 +563,18 @@ class TestInvokeClaudeErrors:
         assert "empty output" in result.lower()
         assert "rephrasing" in result.lower()
 
+    def test_invoke_claude_with_no_session_id(self):
+        """invoke_claude should auto-generate session_id when None."""
+        with mock.patch("subprocess.Popen") as mock_popen:
+            proc = mock.MagicMock()
+            proc.poll.side_effect = [None, 0]
+            proc.stdout.read.return_value = "hello"
+            proc.stderr.read.return_value = ""
+            proc.returncode = 0
+            mock_popen.return_value = proc
+            with mock.patch("time.sleep"):
+                result = bridge.invoke_claude("hi")
+        assert result == "hello"
 
 
 # ---------------------------------------------------------------------------
@@ -672,6 +686,187 @@ class TestRateLimiting:
         bridge._record_invocation()
         timestamps = json.loads(bridge.RATE_LIMIT_FILE.read_text())
         assert len(timestamps) == 2
+
+
+# ---------------------------------------------------------------------------
+# Slack MCP functions
+# ---------------------------------------------------------------------------
+
+
+class TestSlackMessageParsing:
+    """Tests for Slack MCP message parsing."""
+
+    def test_parse_new_messages_basic(self):
+        channel_text = (
+            "=== Message from user1 (U123)\n"
+            "Message TS: 1000.001\n"
+            "Hello world\n"
+            "\n"
+            "=== Message from user2 (U456)\n"
+            "Message TS: 1000.002\n"
+            "Another message\n"
+        )
+        messages = bridge.parse_new_messages(channel_text, "999.000")
+        assert len(messages) == 2
+        assert messages[0]["user"] == "U123"
+        assert messages[0]["ts"] == "1000.001"
+        assert "Hello world" in messages[0]["text"]
+        assert messages[1]["user"] == "U456"
+
+    def test_parse_new_messages_filters_old(self):
+        channel_text = (
+            "=== Message from user1 (U123)\n"
+            "Message TS: 900.001\n"
+            "Old message\n"
+            "\n"
+            "=== Message from user2 (U456)\n"
+            "Message TS: 1100.002\n"
+            "New message\n"
+        )
+        messages = bridge.parse_new_messages(channel_text, "1000.000")
+        assert len(messages) == 1
+        assert messages[0]["ts"] == "1100.002"
+
+    def test_parse_thread_replies(self):
+        thread_text = (
+            "=== Original message ===\n"
+            "Some original\n"
+            "\n"
+            "THREAD REPLIES\n"
+            "\n"
+            "--- Reply 1 ---\n"
+            "From: user1 (U123)\n"
+            "Message TS: 1000.005\n"
+            "Reply text\n"
+        )
+        replies = bridge.parse_thread_replies(thread_text, "999.000")
+        assert len(replies) == 1
+        assert replies[0]["user"] == "U123"
+        assert "Reply text" in replies[0]["text"]
+
+    def test_should_process_normal_message(self):
+        assert bridge.should_process({"text": "hello"}) is True
+
+    def test_should_process_skips_agent_prefix(self):
+        assert bridge.should_process({"text": f"{bridge.AGENT_PREFIX} response"}) is False
+
+    def test_should_process_skips_empty(self):
+        assert bridge.should_process({"text": ""}) is False
+        assert bridge.should_process({"text": "   "}) is False
+
+    def test_should_process_skips_join_message(self):
+        assert bridge.should_process({"text": "user has joined the channel"}) is False
+
+
+class TestSlackState:
+    """Tests for Slack state management."""
+
+    def test_load_slack_state_default(self, tmp_config):
+        with mock.patch.object(bridge, "SLACK_STATE_FILE", tmp_config / "slack_state.json"):
+            state = bridge.load_slack_state()
+        assert state["channel_id"] == ""
+        assert state["active_threads"] == {}
+
+    def test_slack_state_roundtrip(self, tmp_config):
+        state_file = tmp_config / "slack_state.json"
+        with mock.patch.object(bridge, "SLACK_STATE_FILE", state_file):
+            state = {"channel_id": "C123", "channel_name": "test", "last_checked_ts": "1000.0", "active_threads": {"1000.1": "1000.2"}}
+            bridge.save_slack_state(state)
+            loaded = bridge.load_slack_state()
+            assert loaded["channel_id"] == "C123"
+            assert loaded["active_threads"]["1000.1"] == "1000.2"
+
+
+class TestSlackTokenManagement:
+    """Tests for Slack MCP token loading."""
+
+    def test_load_credentials_missing_file(self, tmp_config):
+        with mock.patch.object(bridge, "CREDENTIALS_FILE", tmp_config / "nonexistent.json"):
+            result = bridge._load_credentials()
+        assert result == {}
+
+    def test_find_slack_token_entry_found(self):
+        creds = {
+            "mcpOAuth": {
+                "slack-mcp-key": {
+                    "serverUrl": "https://mcp.slack.com/mcp",
+                    "accessToken": "xoxe.xoxp-test-token",
+                    "expiresAt": int(time.time() * 1000) + 3600000,
+                }
+            }
+        }
+        entry = bridge._find_slack_token_entry(creds)
+        assert entry is not None
+        assert entry["accessToken"] == "xoxe.xoxp-test-token"
+
+    def test_find_slack_token_entry_not_found(self):
+        creds = {"mcpOAuth": {"other-key": {"serverUrl": "https://example.com", "accessToken": "abc"}}}
+        entry = bridge._find_slack_token_entry(creds)
+        assert entry is None
+
+    def test_get_slack_token_expired(self, tmp_config):
+        creds = {
+            "mcpOAuth": {
+                "slack-mcp-key": {
+                    "serverUrl": "https://mcp.slack.com/mcp",
+                    "accessToken": "xoxe.xoxp-test-token",
+                    "expiresAt": int(time.time() * 1000) - 3600000,  # expired
+                }
+            }
+        }
+        creds_file = tmp_config / "creds.json"
+        creds_file.write_text(json.dumps(creds))
+        with mock.patch.object(bridge, "CREDENTIALS_FILE", creds_file):
+            token = bridge.get_slack_token()
+        assert token is None
+
+
+class TestMcpTextExtraction:
+    """Tests for MCP result text extraction."""
+
+    def test_extract_mcp_text_with_messages(self):
+        result = {
+            "content": [
+                {"type": "text", "text": json.dumps({"messages": "Hello world"})}
+            ]
+        }
+        assert bridge._extract_mcp_text(result) == "Hello world"
+
+    def test_extract_mcp_text_raw_fallback(self):
+        result = {
+            "content": [
+                {"type": "text", "text": "plain text fallback"}
+            ]
+        }
+        assert bridge._extract_mcp_text(result) == "plain text fallback"
+
+    def test_extract_mcp_text_none_for_empty(self):
+        assert bridge._extract_mcp_text({}) is None
+        assert bridge._extract_mcp_text(None) is None
+
+
+class TestBusinessHours:
+    """Tests for business hours check."""
+
+    def test_business_hours_disabled(self):
+        with mock.patch.object(bridge, "BUSINESS_HOURS_ONLY", False):
+            assert bridge.is_business_hours() is True
+
+    def test_business_hours_within(self):
+        with mock.patch.object(bridge, "BUSINESS_HOURS_ONLY", True), \
+             mock.patch.object(bridge, "BUSINESS_HOURS_START", 8), \
+             mock.patch.object(bridge, "BUSINESS_HOURS_END", 22):
+            with mock.patch("bridge.datetime") as mock_dt:
+                mock_dt.now.return_value = datetime(2026, 3, 7, 12, 0, 0)
+                assert bridge.is_business_hours() is True
+
+    def test_business_hours_outside(self):
+        with mock.patch.object(bridge, "BUSINESS_HOURS_ONLY", True), \
+             mock.patch.object(bridge, "BUSINESS_HOURS_START", 8), \
+             mock.patch.object(bridge, "BUSINESS_HOURS_END", 22):
+            with mock.patch("bridge.datetime") as mock_dt:
+                mock_dt.now.return_value = datetime(2026, 3, 7, 3, 0, 0)
+                assert bridge.is_business_hours() is False
 
 
 if __name__ == "__main__":
