@@ -59,7 +59,7 @@ SCOPES = [
     "https://www.googleapis.com/auth/gmail.send",
 ]
 
-POLL_INTERVAL = int(os.environ.get("CLAUDE_REMOTE_POLL_INTERVAL", "30"))
+POLL_INTERVAL = int(os.environ.get("CLAUDE_REMOTE_POLL_INTERVAL", "15"))
 CLAUDE_TIMEOUT = 600  # 10 minutes
 MAX_RESPONSE_LEN = 50_000  # chars
 CLAUDE_CWD = str(Path.home() / "Projects")
@@ -108,6 +108,8 @@ BUSINESS_HOURS_START = int(os.environ.get("CLAUDE_REMOTE_BIZ_START", "8"))
 BUSINESS_HOURS_END = int(os.environ.get("CLAUDE_REMOTE_BIZ_END", "22"))
 BUSINESS_HOURS_ONLY = os.environ.get("CLAUDE_REMOTE_BIZ_ONLY", "false").lower() == "true"
 SLACK_CHANNEL_NAME = os.environ.get("CLAUDE_REMOTE_SLACK_CHANNEL", "zhengli-agent")
+SLACK_USER_ID = os.environ.get("CLAUDE_REMOTE_SLACK_USER_ID", "")
+SLACK_NOTIFY_THRESHOLD = int(os.environ.get("CLAUDE_REMOTE_NOTIFY_THRESHOLD", "30"))  # seconds
 
 # Module-level state (set in run_bridge)
 _startup_time: Optional[datetime] = None
@@ -1318,7 +1320,7 @@ def should_process(msg: dict) -> bool:
         return False
     if "Sent using" in text and "Claude" in text:
         return False
-    if "<@U09RKUYGCM6" in text:
+    if SLACK_USER_ID and f"<@{SLACK_USER_ID}" in text:
         return False
     if "has joined the channel" in text:
         return False
@@ -1461,10 +1463,15 @@ def slack_poll_cycle(token: str, state: dict):
             )
 
         _record_invocation()
+        start_time = time.time()
         response = invoke_claude(prompt, thread_id=thread_ts)
+        elapsed = time.time() - start_time
 
-        # Post reply
-        reply_text = f"{AGENT_PREFIX} {response}"
+        # Post reply - @mention user if task took longer than threshold
+        if SLACK_USER_ID and elapsed >= SLACK_NOTIFY_THRESHOLD:
+            reply_text = f"{AGENT_PREFIX} <@{SLACK_USER_ID}> {response}"
+        else:
+            reply_text = f"{AGENT_PREFIX} {response}"
         success = mcp_send_message(token, channel_id, thread_ts, reply_text)
 
         if success:
