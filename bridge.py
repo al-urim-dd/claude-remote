@@ -46,6 +46,20 @@ from googleapiclient.discovery import build
 # ---------------------------------------------------------------------------
 
 CONFIG_DIR = Path.home() / ".claude-remote"
+
+# Load env overrides from ~/.claude-remote/env
+_env_file = CONFIG_DIR / "env"
+if _env_file.is_file():
+    with open(_env_file) as _f:
+        for _line in _f:
+            _line = _line.strip()
+            if _line and not _line.startswith("#") and "=" in _line:
+                if _line.startswith("export "):
+                    _line = _line[7:]
+                _key, _, _val = _line.partition("=")
+                _val = _val.strip('"').strip("'").replace("$HOME", str(Path.home()))
+                os.environ.setdefault(_key.strip(), _val)
+
 CLIENT_SECRET = CONFIG_DIR / "client_secret.json"
 TOKEN_FILE = CONFIG_DIR / "token.json"
 GMAIL_PROCESSED_FILE = CONFIG_DIR / "processed.txt"
@@ -62,7 +76,7 @@ SCOPES = [
 POLL_INTERVAL = int(os.environ.get("CLAUDE_REMOTE_POLL_INTERVAL", "15"))
 CLAUDE_TIMEOUT = 600  # 10 minutes
 MAX_RESPONSE_LEN = 50_000  # chars
-CLAUDE_CWD = str(Path.home() / "Projects")
+CLAUDE_CWD = os.environ.get("CLAUDE_REMOTE_CWD", str(Path.home() / "Projects"))
 SUBJECT_PREFIX = "cc"
 REPLY_SENDER_NAME = "ClaudeRemote"  # Display name on reply emails
 ATTACHMENTS_DIR = CONFIG_DIR / "attachments"
@@ -612,6 +626,19 @@ def list_sessions(count: int = 10) -> str:
     return header + "\n\n".join(entries)
 
 
+def delete_claude_session(session_id: str):
+    """Delete a Claude Code session file from disk."""
+    cwd_slug = CLAUDE_CWD.replace("/", "-").replace(".", "-")
+    session_file = CLAUDE_SESSIONS_DIR / cwd_slug / f"{session_id}.jsonl"
+    try:
+        session_file.unlink()
+        log.info("Deleted Claude session file: %s", session_id[:8])
+    except FileNotFoundError:
+        pass
+    except OSError as e:
+        log.warning("Failed to delete session file %s: %s", session_id[:8], e)
+
+
 # ---------------------------------------------------------------------------
 # Gmail State Management
 # ---------------------------------------------------------------------------
@@ -943,6 +970,7 @@ def gmail_poll_cycle(
             session_id = thread_sessions[thread_id]
         else:
             session_id = str(uuid.uuid4())
+        log.info("Session for thread %s: session=%s, resume=%s", thread_id, session_id[:8], resume)
 
         # Build attachment preamble
         att_preamble = ""
@@ -1049,10 +1077,11 @@ def gmail_poll_cycle(
 
 def _load_credentials() -> dict:
     """Load the Claude Code credentials file."""
-    if not CREDENTIALS_FILE.exists():
-        log.error("Credentials file not found: %s", CREDENTIALS_FILE)
+    try:
+        return json.loads(CREDENTIALS_FILE.read_text())
+    except (FileNotFoundError, PermissionError) as e:
+        log.error("Credentials file not found: %s (%s)", CREDENTIALS_FILE, e)
         return {}
-    return json.loads(CREDENTIALS_FILE.read_text())
 
 
 def _find_slack_token_entry(creds: dict) -> Optional[dict]:
@@ -1068,10 +1097,28 @@ def _find_slack_token_entry(creds: dict) -> Optional[dict]:
     return None
 
 
+SLACK_TOKEN_FILE = CONFIG_DIR / "slack_mcp_token.json"
+
+
 def get_slack_token() -> Optional[str]:
-    """Get the current Slack OAuth access token from Claude Code credentials."""
-    creds = _load_credentials()
-    entry = _find_slack_token_entry(creds)
+    """Get the Slack OAuth access token.
+
+    Checks in order:
+    1. Bridge's own token file (~/.claude-remote/slack_mcp_token.json)
+    2. Claude Code credentials file (~/.claude/.credentials.json)
+    """
+    # Try bridge's own persistent token first
+    entry = None
+    try:
+        entry = json.loads(SLACK_TOKEN_FILE.read_text())
+    except (FileNotFoundError, PermissionError):
+        pass
+
+    # Fall back to Claude Code credentials
+    if not entry or not entry.get("accessToken"):
+        creds = _load_credentials()
+        entry = _find_slack_token_entry(creds)
+
     if not entry:
         log.error("No active Slack MCP token found in credentials")
         return None
@@ -1081,8 +1128,7 @@ def get_slack_token() -> Optional[str]:
     now_ms = int(time.time() * 1000)
     if expires_at and now_ms > expires_at:
         log.warning(
-            "Slack token expired at %s. Run any Slack MCP tool in Claude Code "
-            "to refresh it, then restart the bridge.",
+            "Slack token expired at %s. Run: .venv/bin/python slack_oauth.py",
             datetime.fromtimestamp(expires_at / 1000).isoformat(),
         )
         return None
@@ -1376,10 +1422,24 @@ def slack_poll_cycle(token: str, state: dict):
 
     # 2. Check active threads for new replies
     new_thread_replies = []
+    thread_failures = state.get("thread_failures", {})
     for thread_ts, last_reply_ts in list(active_threads.items()):
         thread_text = mcp_read_thread(token, channel_id, thread_ts)
         if thread_text is None:
+            count = thread_failures.get(thread_ts, 0) + 1
+            thread_failures[thread_ts] = count
+            if count >= 3:
+                log.info("Removing stale thread %s after %d failures", thread_ts, count)
+                session_id = state.get("thread_sessions", {}).pop(thread_ts, None)
+                if session_id:
+                    delete_claude_session(session_id)
+                active_threads.pop(thread_ts, None)
+                thread_failures.pop(thread_ts, None)
+            else:
+                log.info("Thread %s read failed (%d/3)", thread_ts, count)
             continue
+        # Reset failure count on success
+        thread_failures.pop(thread_ts, None)
         replies = parse_thread_replies(thread_text, last_reply_ts)
         for reply in replies:
             reply["thread_ts"] = thread_ts
@@ -1409,7 +1469,9 @@ def slack_poll_cycle(token: str, state: dict):
                 newest_ts = msg["ts"]
         if newest_ts != last_ts:
             state["last_checked_ts"] = newest_ts
-            save_slack_state(state)
+        # Always save if thread_failures changed or timestamp updated
+        state["thread_failures"] = thread_failures
+        save_slack_state(state)
         return
 
     log.info(
@@ -1439,10 +1501,20 @@ def slack_poll_cycle(token: str, state: dict):
         # Acknowledge receipt with eyes emoji
         mcp_add_reaction(token, channel_id, msg["ts"], "eyes")
 
-        log.info("Processing: %.80s", text)
+        # Determine session: resume existing or start new
+        thread_sessions = state.get("thread_sessions", {})
+        resume = thread_ts in thread_sessions
+        if resume:
+            session_id = thread_sessions[thread_ts]
+        else:
+            session_id = str(uuid.uuid4())
+        log.info("Processing (session=%s, resume=%s): %.80s", session_id[:8], resume, text)
 
         # Build prompt for Claude
-        if msg["is_thread_reply"]:
+        if resume:
+            # Resumed session already has context; just send the new message
+            prompt = text
+        elif msg["is_thread_reply"]:
             thread_context = msg.get("thread_context", "")
             prompt = (
                 f"You are an AI assistant replying in a Slack thread. "
@@ -1464,7 +1536,32 @@ def slack_poll_cycle(token: str, state: dict):
 
         _record_invocation()
         start_time = time.time()
-        response = invoke_claude(prompt, thread_id=thread_ts)
+        response = invoke_claude(prompt, session_id, resume=resume, thread_id=thread_ts)
+
+        # If resume failed, retry fresh with full thread context
+        if resume and "[Claude exited with code" in response:
+            log.warning("Resume failed for Slack session %s, retrying fresh", session_id[:8])
+            session_id = str(uuid.uuid4())
+            thread_context = msg.get("thread_context", "")
+            if thread_context:
+                prompt = (
+                    f"You are an AI assistant replying in a Slack thread. "
+                    f"Here is the full thread context:\n\n{thread_context}\n\n"
+                    f"The latest message is: {text}\n\n"
+                    f"Respond to this latest message. Use Slack mrkdwn formatting "
+                    f"(*bold*, _italic_, `code`). Be concise and helpful. "
+                    f"Use all available MCP tools if needed."
+                )
+            else:
+                prompt = (
+                    f"You are an AI assistant responding to a Slack message. "
+                    f"The message is: {text}\n\n"
+                    f"Process this as a task. Use all available MCP tools "
+                    f"(Slack, Google Workspace, Glean, etc.) as needed. "
+                    f"Use Slack mrkdwn formatting (*bold*, _italic_, `code`). "
+                    f"Be concise and helpful."
+                )
+            response = invoke_claude(prompt, session_id, resume=False, thread_id=thread_ts)
         elapsed = time.time() - start_time
 
         # Post reply - @mention user if task took longer than threshold
@@ -1476,11 +1573,13 @@ def slack_poll_cycle(token: str, state: dict):
 
         if success:
             replied += 1
-            log.info("Replied to message %s", msg["ts"])
+            log.info("Replied to message %s (session=%s)", msg["ts"], session_id[:8])
             # Mark done with checkmark
             mcp_add_reaction(token, channel_id, msg["ts"], "white_check_mark")
-            # Track thread
+            # Track thread and session
             active_threads[thread_ts] = msg["ts"]
+            thread_sessions[thread_ts] = session_id
+            state["thread_sessions"] = thread_sessions
         else:
             log.error("Failed to reply to message %s", msg["ts"])
 
@@ -1504,12 +1603,27 @@ def slack_poll_cycle(token: str, state: dict):
 
     # Prune stale threads (>7 days)
     cutoff = time.time() - 7 * 86400
+    pruned_threads = {
+        k for k, v in active_threads.items()
+        if float(v) <= cutoff
+    }
     active_threads = {
         k: v for k, v in active_threads.items()
-        if float(v) > cutoff
+        if k not in pruned_threads
+    }
+    thread_sessions = state.get("thread_sessions", {})
+    for thread_ts in pruned_threads:
+        session_id = thread_sessions.pop(thread_ts, None)
+        if session_id:
+            delete_claude_session(session_id)
+    thread_sessions = {
+        k: v for k, v in thread_sessions.items()
+        if k in active_threads
     }
 
     state["active_threads"] = active_threads
+    state["thread_sessions"] = thread_sessions
+    state["thread_failures"] = thread_failures
     save_slack_state(state)
 
     log.info("Processed %d, replied to %d", len(to_process), replied)
@@ -1628,8 +1742,10 @@ def run_bridge(foreground: bool = False, gmail_enabled: bool = True, slack_enabl
                     if not slack_token:
                         log.warning("Slack token expired or missing")
                     else:
+                        log.info("Starting Slack poll cycle")
                         slack_state = load_slack_state()
                         slack_poll_cycle(slack_token, slack_state)
+                        log.info("Slack poll cycle complete")
                 except Exception:
                     log.exception("Error in Slack poll cycle")
 
