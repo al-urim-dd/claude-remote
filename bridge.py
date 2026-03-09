@@ -1512,10 +1512,10 @@ def slack_poll_cycle(token: str, state: dict):
 
         # Build prompt for Claude
         no_post_rule = (
-            "CRITICAL RULE: NEVER send Slack messages yourself. NEVER use "
-            "slack_send_message or any tool that posts to Slack. You are only "
-            "generating a text response that the bridge will post on your behalf. "
-            "You may READ Slack channels and threads for research, but NEVER WRITE. "
+            "SLACK POSTING RULE: You may ONLY post to the current thread "
+            f"(channel {channel_id}, thread_ts {thread_ts}). "
+            "Do NOT post to any other channel, thread, or DM unless the user "
+            "explicitly asks you to. Do NOT start new threads or send DMs. "
         )
         if resume:
             # Resumed session already has context; just send the new message
