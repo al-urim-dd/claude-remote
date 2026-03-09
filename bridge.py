@@ -1511,25 +1511,33 @@ def slack_poll_cycle(token: str, state: dict):
         log.info("Processing (session=%s, resume=%s): %.80s", session_id[:8], resume, text)
 
         # Build prompt for Claude
+        no_post_rule = (
+            "CRITICAL RULE: NEVER send Slack messages yourself. NEVER use "
+            "slack_send_message or any tool that posts to Slack. You are only "
+            "generating a text response that the bridge will post on your behalf. "
+            "You may READ Slack channels and threads for research, but NEVER WRITE. "
+        )
         if resume:
             # Resumed session already has context; just send the new message
-            prompt = text
+            prompt = f"{no_post_rule}{text}"
         elif msg["is_thread_reply"]:
             thread_context = msg.get("thread_context", "")
             prompt = (
+                f"{no_post_rule}"
                 f"You are an AI assistant replying in a Slack thread. "
                 f"Here is the full thread context:\n\n{thread_context}\n\n"
                 f"The latest message is: {text}\n\n"
                 f"Respond to this latest message. Use Slack mrkdwn formatting "
                 f"(*bold*, _italic_, `code`). Be concise and helpful. "
-                f"Use all available MCP tools if needed."
+                f"Use all available MCP tools for research if needed."
             )
         else:
             prompt = (
+                f"{no_post_rule}"
                 f"You are an AI assistant responding to a Slack message. "
                 f"The message is: {text}\n\n"
                 f"Process this as a task. Use all available MCP tools "
-                f"(Slack, Google Workspace, Glean, etc.) as needed. "
+                f"(Slack search, Google Workspace, Glean, etc.) for research. "
                 f"Use Slack mrkdwn formatting (*bold*, _italic_, `code`). "
                 f"Be concise and helpful."
             )
@@ -1545,15 +1553,17 @@ def slack_poll_cycle(token: str, state: dict):
             thread_context = msg.get("thread_context", "")
             if thread_context:
                 prompt = (
+                    f"{no_post_rule}"
                     f"You are an AI assistant replying in a Slack thread. "
                     f"Here is the full thread context:\n\n{thread_context}\n\n"
                     f"The latest message is: {text}\n\n"
                     f"Respond to this latest message. Use Slack mrkdwn formatting "
                     f"(*bold*, _italic_, `code`). Be concise and helpful. "
-                    f"Use all available MCP tools if needed."
+                    f"Use all available MCP tools for research if needed."
                 )
             else:
                 prompt = (
+                    f"{no_post_rule}"
                     f"You are an AI assistant responding to a Slack message. "
                     f"The message is: {text}\n\n"
                     f"Process this as a task. Use all available MCP tools "
