@@ -75,7 +75,7 @@ SCOPES = [
 ]
 
 POLL_INTERVAL = int(os.environ.get("CLAUDE_REMOTE_POLL_INTERVAL", "15"))
-CLAUDE_TIMEOUT = 600  # 10 minutes
+CLAUDE_TIMEOUT = 1800  # 30 minutes
 MAX_RESPONSE_LEN = 50_000  # chars
 CLAUDE_CWD = os.environ.get("CLAUDE_REMOTE_CWD", str(Path.home() / "Projects"))
 SUBJECT_PREFIX = "cc"
