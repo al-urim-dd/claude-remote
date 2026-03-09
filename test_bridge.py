@@ -466,7 +466,7 @@ class TestDailyDigest:
         send_mock = mock_service.users.return_value.messages.return_value.send
         send_mock.return_value.execute.return_value = {"id": "d1"}
 
-        with mock.patch.object(bridge, "_invoke_skill", return_value="# Morning Brief\nTest content") as mock_skill:
+        with mock.patch.object(bridge, "_skill_exists", return_value=True),              mock.patch.object(bridge, "_invoke_skill", return_value="# Morning Brief\nTest content") as mock_skill:
             bridge.send_daily_digest(mock_service, "me@test.com", {}, 0)
 
         mock_skill.assert_called_once_with("brief")
@@ -478,11 +478,25 @@ class TestDailyDigest:
         send_mock = mock_service.users.return_value.messages.return_value.send
         send_mock.return_value.execute.return_value = {"id": "d1"}
 
-        with mock.patch.object(bridge, "_invoke_skill", return_value="# Summary\nTest") as mock_skill:
+        with mock.patch.object(bridge, "_skill_exists", return_value=True),              mock.patch.object(bridge, "_invoke_skill", return_value="# Summary\nTest") as mock_skill:
             bridge.send_work_summary(mock_service, "me@test.com")
 
         mock_skill.assert_called_once_with("summary")
         send_mock.assert_called_once()
+
+    def test_digest_skipped_if_brief_skill_missing(self, tmp_config):
+        """Digest must not send if /brief skill directory is missing."""
+        mock_service = mock.MagicMock()
+        with mock.patch.object(bridge, "_skill_exists", return_value=False):
+            bridge.send_daily_digest(mock_service, "me@test.com", {}, 0)
+        mock_service.users().messages().send.assert_not_called()
+
+    def test_summary_skipped_if_summary_skill_missing(self, tmp_config):
+        """Work summary must not send if /summary skill directory is missing."""
+        mock_service = mock.MagicMock()
+        with mock.patch.object(bridge, "_skill_exists", return_value=False):
+            bridge.send_work_summary(mock_service, "me@test.com")
+        mock_service.users().messages().send.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
@@ -819,6 +833,89 @@ class TestSlackTokenManagement:
         with mock.patch.object(bridge, "CREDENTIALS_FILE", creds_file):
             token = bridge.get_slack_token()
         assert token is None
+
+
+class TestSlackTokenRefresh:
+    """Tests for Slack token auto-refresh."""
+
+    def test_refresh_success(self, tmp_config):
+        """Successful refresh returns new entry and writes token file."""
+        entry = {
+            "serverUrl": "https://mcp.slack.com/mcp",
+            "accessToken": "old-token",
+            "refreshToken": "refresh-123",
+            "expiresAt": int(time.time() * 1000) - 1000,
+        }
+        mock_response = json.dumps({
+            "ok": True,
+            "access_token": "new-token",
+            "refresh_token": "refresh-456",
+            "expires_in": 43200,
+        }).encode()
+
+        token_file = tmp_config / "slack_mcp_token.json"
+        with mock.patch.object(bridge, "SLACK_TOKEN_FILE", token_file), \
+             mock.patch("bridge.urlopen") as mock_urlopen:
+            mock_resp = mock.MagicMock()
+            mock_resp.read.return_value = mock_response
+            mock_resp.__enter__ = mock.MagicMock(return_value=mock_resp)
+            mock_resp.__exit__ = mock.MagicMock(return_value=False)
+            mock_urlopen.return_value = mock_resp
+
+            result = bridge._refresh_slack_token(entry)
+
+        assert result is not None
+        assert result["accessToken"] == "new-token"
+        assert result["refreshToken"] == "refresh-456"
+        assert token_file.exists()
+
+    def test_refresh_no_refresh_token(self, tmp_config):
+        """Refresh returns None when no refreshToken is present."""
+        entry = {
+            "serverUrl": "https://mcp.slack.com/mcp",
+            "accessToken": "some-token",
+        }
+        result = bridge._refresh_slack_token(entry)
+        assert result is None
+
+    def test_refresh_api_failure(self, tmp_config):
+        """Refresh returns None when Slack API returns error."""
+        entry = {
+            "serverUrl": "https://mcp.slack.com/mcp",
+            "accessToken": "old-token",
+            "refreshToken": "refresh-123",
+        }
+        mock_response = json.dumps({"ok": False, "error": "invalid_refresh_token"}).encode()
+
+        with mock.patch("bridge.urlopen") as mock_urlopen, \
+             mock.patch.object(bridge, "_notify_refresh_failure"):
+            mock_resp = mock.MagicMock()
+            mock_resp.read.return_value = mock_response
+            mock_resp.__enter__ = mock.MagicMock(return_value=mock_resp)
+            mock_resp.__exit__ = mock.MagicMock(return_value=False)
+            mock_urlopen.return_value = mock_resp
+
+            result = bridge._refresh_slack_token(entry)
+
+        assert result is None
+
+    def test_proactive_refresh_skipped_without_refresh_token(self, tmp_config):
+        """get_slack_token should not attempt refresh when no refreshToken."""
+        entry = {
+            "serverUrl": "https://mcp.slack.com/mcp",
+            "accessToken": "valid-token",
+            "expiresAt": int((time.time() + 1800) * 1000),  # 30 min left
+        }
+        token_file = tmp_config / "slack_mcp_token.json"
+        token_file.write_text(json.dumps(entry))
+
+        with mock.patch.object(bridge, "SLACK_TOKEN_FILE", token_file), \
+             mock.patch.object(bridge, "SLACK_TOKEN_REFRESH_HOURS", 2), \
+             mock.patch.object(bridge, "_refresh_slack_token") as mock_refresh:
+            token = bridge.get_slack_token()
+
+        assert token == "valid-token"
+        mock_refresh.assert_not_called()
 
 
 class TestMcpTextExtraction:

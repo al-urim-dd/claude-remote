@@ -1132,6 +1132,7 @@ SLACK_TOKEN_FILE = CONFIG_DIR / "slack_mcp_token.json"
 SLACK_MCP_CLIENT_ID = "1601185624273.8899143856786"
 # Refresh token when it has less than this many hours left (0 = disabled)
 SLACK_TOKEN_REFRESH_HOURS = int(os.environ.get("CLAUDE_REMOTE_SLACK_REFRESH_HOURS", "2"))
+_script_dir = Path(__file__).resolve().parent
 
 
 def _notify_refresh_failure(entry: dict, error_msg: str):
@@ -1145,7 +1146,7 @@ def _notify_refresh_failure(entry: dict, error_msg: str):
         if channel_id:
             msg = (
                 f"{AGENT_PREFIX} :warning: {error_msg}\n"
-                f"Run `cd ~/Projects/claude-remote && .venv/bin/python slack_oauth.py` to re-authenticate."
+                f"Run `cd {_script_dir} && .venv/bin/python slack_oauth.py` to re-authenticate."
             )
             _mcp_call("slack_send_message", {
                 "channel_id": channel_id,
@@ -1243,7 +1244,7 @@ def get_slack_token() -> Optional[str]:
 
         if now_ms > expires_at:
             # Token expired — try refresh before giving up
-            if SLACK_TOKEN_REFRESH_HOURS > 0:
+            if SLACK_TOKEN_REFRESH_HOURS > 0 and entry.get("refreshToken"):
                 refreshed = _refresh_slack_token(entry)
                 if refreshed:
                     return refreshed["accessToken"]
@@ -1254,11 +1255,14 @@ def get_slack_token() -> Optional[str]:
             return None
 
         if SLACK_TOKEN_REFRESH_HOURS > 0 and remaining_hours < SLACK_TOKEN_REFRESH_HOURS:
-            log.info("Slack token expires in %.1f hours, refreshing proactively", remaining_hours)
-            refreshed = _refresh_slack_token(entry)
-            if refreshed:
-                return refreshed["accessToken"]
-            # If refresh fails, continue with current token
+            if entry.get("refreshToken"):
+                log.info("Slack token expires in %.1f hours, refreshing proactively", remaining_hours)
+                refreshed = _refresh_slack_token(entry)
+                if refreshed:
+                    return refreshed["accessToken"]
+            else:
+                log.debug("Slack token expires in %.1f hours but no refresh token available", remaining_hours)
+            # If refresh fails or no refresh token, continue with current token
 
     return entry["accessToken"]
 
@@ -1531,6 +1535,13 @@ def save_slack_state(state: dict):
 # Slack Poll Cycle
 # ---------------------------------------------------------------------------
 
+SLACK_POSTING_RULE = (
+    "SLACK POSTING RULE: You may ONLY post to the current thread "
+    "(channel {channel_id}, thread_ts {thread_ts}). "
+    "Do NOT post to any other channel, thread, or DM unless the user explicitly asks you to. "
+    "Do NOT start new threads or send DMs."
+)
+
 
 def slack_poll_cycle(token: str, state: dict):
     """Single Slack poll iteration."""
@@ -1643,7 +1654,9 @@ def slack_poll_cycle(token: str, state: dict):
             prompt = text
         elif msg["is_thread_reply"]:
             thread_context = msg.get("thread_context", "")
+            posting_rule = SLACK_POSTING_RULE.format(channel_id=channel_id, thread_ts=thread_ts)
             prompt = (
+                f"{posting_rule}\n\n"
                 f"You are an AI assistant replying in a Slack thread. "
                 f"Here is the full thread context:\n\n{thread_context}\n\n"
                 f"The latest message is: {text}\n\n"
@@ -1652,7 +1665,9 @@ def slack_poll_cycle(token: str, state: dict):
                 f"Use all available MCP tools if needed."
             )
         else:
+            posting_rule = SLACK_POSTING_RULE.format(channel_id=channel_id, thread_ts=thread_ts)
             prompt = (
+                f"{posting_rule}\n\n"
                 f"You are an AI assistant responding to a Slack message. "
                 f"The message is: {text}\n\n"
                 f"Process this as a task. Use all available MCP tools "
@@ -1671,7 +1686,9 @@ def slack_poll_cycle(token: str, state: dict):
             session_id = str(uuid.uuid4())
             thread_context = msg.get("thread_context", "")
             if thread_context:
+                posting_rule = SLACK_POSTING_RULE.format(channel_id=channel_id, thread_ts=thread_ts)
                 prompt = (
+                    f"{posting_rule}\n\n"
                     f"You are an AI assistant replying in a Slack thread. "
                     f"Here is the full thread context:\n\n{thread_context}\n\n"
                     f"The latest message is: {text}\n\n"
@@ -1680,7 +1697,9 @@ def slack_poll_cycle(token: str, state: dict):
                     f"Use all available MCP tools if needed."
                 )
             else:
+                posting_rule = SLACK_POSTING_RULE.format(channel_id=channel_id, thread_ts=thread_ts)
                 prompt = (
+                    f"{posting_rule}\n\n"
                     f"You are an AI assistant responding to a Slack message. "
                     f"The message is: {text}\n\n"
                     f"Process this as a task. Use all available MCP tools "

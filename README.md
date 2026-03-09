@@ -213,7 +213,7 @@ Create `~/.claude-remote/env` to override settings, or edit constants at the top
 
 | Setting | Default | Env var | Description |
 |---------|---------|---------|-------------|
-| `POLL_INTERVAL` | `30` | `CLAUDE_REMOTE_POLL_INTERVAL` | Seconds between polls |
+| `POLL_INTERVAL` | `15` | `CLAUDE_REMOTE_POLL_INTERVAL` | Seconds between polls |
 | `CLAUDE_TIMEOUT` | `600` | - | Max seconds per Claude invocation |
 | `MAX_RESPONSE_LEN` | `50000` | - | Truncate replies beyond this |
 | `CLAUDE_CWD` | `~/Projects` | `CLAUDE_REMOTE_CWD` | Working directory for Claude |
@@ -233,4 +233,4 @@ Create `~/.claude-remote/env` to override settings, or edit constants at the top
 - **Rate limiting**: 20 invocations/hour cap prevents runaway costs
 - **Startup safety**: ignores all existing messages on daemon start
 - **Local only**: all processing on your laptop, API calls over HTTPS
-- **Token security**: OAuth credentials stored in `~/.claude-remote/` (chmod 600)
+- **Token security**: OAuth credentials stored in `~/.claude-remote/` (dir chmod 700, secret files chmod 600)
