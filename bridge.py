@@ -1411,77 +1411,117 @@ def mcp_add_reaction(token: str, channel_id: str, message_ts: str, emoji: str = 
 
 
 def mcp_search_messages(token: str, query: str, limit: int = 20) -> Optional[str]:
-    """Search Slack messages across all channels via MCP."""
+    """Search Slack messages across all channels via MCP.
+
+    Returns the search results text, or None on failure.
+    The MCP search tool returns {"results": "...", "pagination_info": "..."}.
+    """
     result = _mcp_call("slack_search_public_and_private", {
         "query": query,
         "limit": limit,
         "include_context": False,
-        "response_format": "detailed",
     }, token)
     if result is None:
         return None
-    return _extract_mcp_text(result)
+    # Extract text from MCP content wrapper
+    raw_text = None
+    if isinstance(result, dict) and "content" in result:
+        for item in result["content"]:
+            if item.get("type") == "text":
+                raw_text = item["text"]
+                break
+    if raw_text is None:
+        return None
+    # The text is JSON with a "results" field containing the formatted output
+    try:
+        parsed = json.loads(raw_text)
+        if isinstance(parsed, dict) and "results" in parsed:
+            return parsed["results"]
+    except (json.JSONDecodeError, ValueError):
+        pass
+    return raw_text
 
 
 def parse_search_results(search_text: str) -> list:
     """Parse MCP search result text into structured message dicts.
 
-    The MCP slack_search_public_and_private tool returns formatted text blocks
-    like:
-        === Message 1 ===
-        Channel: #channel-name (C123456)
-        From: User Name (U123456)
-        Time: 2026-03-15 10:30:00
-        Message TS: 1710499800.000100
-        Thread TS: 1710499700.000050
-        Permalink: https://team.slack.com/archives/C123/p1710499800000100
+    The MCP slack_search_public_and_private tool returns formatted text like:
+
+        ### Result 1 of 4
+        Channel: #channel-name (ID: C123456)
+        From: User Name (ID: U123456)
+        Time: 2026-03-15 10:30:00 GMT
+        Message_ts: 1710499800.000100
+        Reply count: 1
+        Permalink: [link](https://team.slack.com/archives/C123/p1710499800000100)
         Text:
         @ClaudeRemote do something
 
-    Returns list of dicts with channel_id, ts, thread_ts, user_id, text, permalink.
+        ---
+
+    Returns list of dicts with channel_id, ts, user_id, text, permalink.
     """
     results = []
     current = {}
+    in_text = False
 
     for line in search_text.splitlines():
-        line = line.strip()
+        stripped = line.strip()
 
-        if line.startswith("=== Message") or line.startswith("=== Result"):
+        # New result block starts
+        if stripped.startswith("### Result") or stripped.startswith("=== Message") or stripped.startswith("=== Result"):
             if current.get("ts"):
                 results.append(current)
             current = {}
+            in_text = False
             continue
 
-        if line.startswith("Channel:"):
-            # Extract channel ID from "Channel: #name (C123456)"
-            match = re.search(r"\(([A-Z][A-Z0-9]+)\)", line)
+        # Separator between results
+        if stripped == "---":
+            in_text = False
+            continue
+
+        # If we're in text-capture mode, accumulate lines
+        if in_text:
+            if current.get("text"):
+                current["text"] += "\n" + stripped
+            else:
+                current["text"] = stripped
+            continue
+
+        # Parse structured fields
+        if stripped.startswith("Channel:"):
+            # "Channel: #name (ID: C123456)" or "Channel: DM (ID: D123)"
+            match = re.search(r"\(ID:\s*([A-Z][A-Z0-9]+)\)", stripped)
+            if not match:
+                match = re.search(r"\(([A-Z][A-Z0-9]+)\)", stripped)
             if match:
                 current["channel_id"] = match.group(1)
-        elif line.startswith("From:"):
-            match = re.search(r"\(([A-Z][A-Z0-9]+)\)", line)
+        elif stripped.startswith("From:"):
+            match = re.search(r"\(ID:\s*([A-Z][A-Z0-9]+)\)", stripped)
+            if not match:
+                match = re.search(r"\(([A-Z][A-Z0-9]+)\)", stripped)
             if match:
                 current["user_id"] = match.group(1)
-        elif line.startswith("Message TS:"):
-            current["ts"] = line.split(":", 1)[1].strip()
-        elif line.startswith("Thread TS:"):
-            val = line.split(":", 1)[1].strip()
-            if val and val != "None" and val != "N/A":
+        elif stripped.startswith("Message_ts:") or stripped.startswith("Message TS:"):
+            current["ts"] = stripped.split(":", 1)[1].strip()
+        elif stripped.startswith("Thread_ts:") or stripped.startswith("Thread TS:"):
+            val = stripped.split(":", 1)[1].strip()
+            if val and val not in ("None", "N/A", ""):
                 current["thread_ts"] = val
-        elif line.startswith("Permalink:"):
-            current["permalink"] = line.split(":", 1)[1].strip()
-            # Fix: split(":") breaks URLs, rejoin
-            if ":" in line:
-                current["permalink"] = line[len("Permalink:"):].strip()
-        elif line.startswith("Text:"):
-            current["text"] = line[len("Text:"):].strip()
-        elif "text" in current and not any(
-            line.startswith(p) for p in ("Channel:", "From:", "Time:", "Message TS:", "Thread TS:", "Permalink:", "===")
-        ):
-            # Continuation of text field
-            if current["text"]:
-                current["text"] += "\n" + line
+        elif stripped.startswith("Permalink:"):
+            # May be "[link](url)" or just a URL
+            url_match = re.search(r"\((https?://[^\)]+)\)", stripped)
+            if url_match:
+                current["permalink"] = url_match.group(1)
             else:
-                current["text"] = line
+                current["permalink"] = stripped[len("Permalink:"):].strip()
+        elif stripped.startswith("Text:"):
+            # Text field - may have content on same line or next lines
+            text_val = stripped[len("Text:"):].strip()
+            current["text"] = text_val
+            in_text = True
+        # Skip other fields (Time:, Reply count:, Participants:, etc.)
 
     # Don't forget the last message
     if current.get("ts"):

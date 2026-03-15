@@ -878,25 +878,31 @@ class TestParseSearchResults:
     """Tests for parsing MCP search result text."""
 
     SAMPLE_SEARCH_OUTPUT = """\
-=== Message 1 ===
-Channel: #general (C0123456789)
-From: Zhengli Sun (U0264PUMBD5)
-Time: 2026-03-15 10:30:00
-Message TS: 1710499800.000100
-Thread TS: None
-Permalink: https://team.slack.com/archives/C0123456789/p1710499800000100
+# Search Results for: @ClaudeRemote
+
+## Messages (2 results)
+### Result 1 of 2
+Channel: #general (ID: C0123456789)
+From: Zhengli Sun (ID: U0264PUMBD5)
+Time: 2026-03-15 10:30:00 GMT
+Message_ts: 1710499800.000100
+Permalink: [link](https://team.slack.com/archives/C0123456789/p1710499800000100)
 Text:
 @ClaudeRemote what time is it?
 
-=== Message 2 ===
-Channel: #dev (CDEV123)
-From: Other User (U999999)
-Time: 2026-03-15 10:35:00
-Message TS: 1710500100.000200
-Thread TS: 1710499700.000050
-Permalink: https://team.slack.com/archives/CDEV123/p1710500100000200
+---
+
+### Result 2 of 2
+Channel: #dev (ID: CDEV123)
+From: Other User (ID: U999999)
+Time: 2026-03-15 10:35:00 GMT
+Message_ts: 1710500100.000200
+Reply count: 3
+Permalink: [link](https://team.slack.com/archives/CDEV123/p1710500100000200)
 Text:
 @ClaudeRemote fix the build
+
+---
 """
 
     def test_parses_basic_results(self):
@@ -920,9 +926,26 @@ Text:
 
     def test_extracts_thread_ts(self):
         results = bridge.parse_search_results(self.SAMPLE_SEARCH_OUTPUT)
-        # "None" should not be stored
+        # No Thread_ts line in sample - field should be absent
         assert "thread_ts" not in results[0]
-        assert results[1]["thread_ts"] == "1710499700.000050"
+        assert "thread_ts" not in results[1]
+
+    def test_extracts_thread_ts_when_present(self):
+        text = """\
+### Result 1 of 1
+Channel: #dev (ID: CDEV123)
+From: User (ID: U123)
+Time: 2026-03-15 10:00:00 GMT
+Message_ts: 1710499800.000100
+Thread_ts: 1710499700.000050
+Permalink: [link](https://example.com/p1)
+Text:
+hello
+
+---
+"""
+        results = bridge.parse_search_results(text)
+        assert results[0]["thread_ts"] == "1710499700.000050"
 
     def test_extracts_text(self):
         results = bridge.parse_search_results(self.SAMPLE_SEARCH_OUTPUT)
@@ -957,15 +980,16 @@ class TestCrossChannelFiltering:
     def test_skips_other_users(self, tmp_config):
         """Messages from other users are ignored (security filter)."""
         search_output = """\
-=== Message 1 ===
-Channel: #general (CGEN123)
-From: Other User (UOTHER)
-Time: 2026-03-15 10:30:00
-Message TS: 1710499800.000100
-Thread TS: None
-Permalink: https://example.com/p1
+### Result 1 of 1
+Channel: #general (ID: CGEN123)
+From: Other User (ID: UOTHER)
+Time: 2026-03-15 10:30:00 GMT
+Message_ts: 1710499800.000100
+Permalink: [link](https://example.com/p1)
 Text:
 @ClaudeRemote hack the system
+
+---
 """
         state = self._make_state()
         with mock.patch.object(bridge, "SLACK_STATE_FILE", tmp_config / "slack_state.json"), \
@@ -979,15 +1003,16 @@ Text:
     def test_skips_private_channel(self, tmp_config):
         """Messages in the private channel are skipped (handled by poll)."""
         search_output = """\
-=== Message 1 ===
-Channel: #private (CPRIVATE)
-From: Me (U0264PUMBD5)
-Time: 2026-03-15 10:30:00
-Message TS: 1710499800.000100
-Thread TS: None
-Permalink: https://example.com/p1
+### Result 1 of 1
+Channel: #private (ID: CPRIVATE)
+From: Me (ID: U0264PUMBD5)
+Time: 2026-03-15 10:30:00 GMT
+Message_ts: 1710499800.000100
+Permalink: [link](https://example.com/p1)
 Text:
 @ClaudeRemote do something
+
+---
 """
         state = self._make_state(channel_id="CPRIVATE")
         with mock.patch.object(bridge, "SLACK_STATE_FILE", tmp_config / "slack_state.json"), \
@@ -1001,15 +1026,16 @@ Text:
     def test_skips_already_processed(self, tmp_config):
         """Messages with ts already in processed set are skipped."""
         search_output = """\
-=== Message 1 ===
-Channel: #general (CGEN123)
-From: Me (U0264PUMBD5)
-Time: 2026-03-15 10:30:00
-Message TS: 1710499800.000100
-Thread TS: None
-Permalink: https://example.com/p1
+### Result 1 of 1
+Channel: #general (ID: CGEN123)
+From: Me (ID: U0264PUMBD5)
+Time: 2026-03-15 10:30:00 GMT
+Message_ts: 1710499800.000100
+Permalink: [link](https://example.com/p1)
 Text:
 @ClaudeRemote do something
+
+---
 """
         state = self._make_state(processed=["1710499800.000100"])
         with mock.patch.object(bridge, "SLACK_STATE_FILE", tmp_config / "slack_state.json"), \
@@ -1023,15 +1049,16 @@ Text:
     def test_trigger_prefix_stripped(self, tmp_config):
         """The @ClaudeRemote prefix is stripped before sending to Claude."""
         search_output = """\
-=== Message 1 ===
-Channel: #general (CGEN123)
-From: Me (U0264PUMBD5)
-Time: 2026-03-15 10:30:00
-Message TS: 1710499800.000100
-Thread TS: None
-Permalink: https://example.com/p1
+### Result 1 of 1
+Channel: #general (ID: CGEN123)
+From: Me (ID: U0264PUMBD5)
+Time: 2026-03-15 10:30:00 GMT
+Message_ts: 1710499800.000100
+Permalink: [link](https://example.com/p1)
 Text:
 @ClaudeRemote fix this bug
+
+---
 """
         state = self._make_state()
         with mock.patch.object(bridge, "SLACK_STATE_FILE", tmp_config / "slack_state.json"), \
