@@ -25,8 +25,10 @@ import shutil
 import signal
 import subprocess
 import sys
+import threading
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
@@ -134,6 +136,13 @@ _extra_users = os.environ.get("CLAUDE_REMOTE_ALLOWED_USERS", "")
 CROSS_CHANNEL_ALLOWED_USERS: set[str] = {
     uid.strip() for uid in _extra_users.split(",") if uid.strip()
 }
+
+# Concurrency
+MAX_CONCURRENT_INVOCATIONS = int(os.environ.get("CLAUDE_REMOTE_MAX_CONCURRENT", "3"))
+_executor: Optional[ThreadPoolExecutor] = None
+_state_lock = threading.Lock()
+_inflight: set = set()
+_inflight_lock = threading.Lock()
 
 # Module-level state (set in run_bridge)
 _startup_time: Optional[datetime] = None
@@ -688,39 +697,120 @@ def save_thread_sessions(sessions: dict):
 
 
 def _check_rate_limit() -> tuple:
-    """Check if we're within the rate limit. Returns (allowed, remaining)."""
-    now = time.time()
-    cutoff = now - 3600  # 1 hour window
+    """Check if we're within the rate limit. Returns (allowed, remaining). Thread-safe."""
+    with _state_lock:
+        now = time.time()
+        cutoff = now - 3600  # 1 hour window
 
-    timestamps = []
-    if RATE_LIMIT_FILE.exists():
-        try:
-            timestamps = json.loads(RATE_LIMIT_FILE.read_text())
-        except (json.JSONDecodeError, ValueError):
-            timestamps = []
+        timestamps = []
+        if RATE_LIMIT_FILE.exists():
+            try:
+                timestamps = json.loads(RATE_LIMIT_FILE.read_text())
+            except (json.JSONDecodeError, ValueError):
+                timestamps = []
 
-    # Prune old entries
-    timestamps = [t for t in timestamps if t > cutoff]
+        # Prune old entries
+        timestamps = [t for t in timestamps if t > cutoff]
 
-    remaining = RATE_LIMIT_PER_HOUR - len(timestamps)
-    return remaining > 0, max(remaining, 0)
+        remaining = RATE_LIMIT_PER_HOUR - len(timestamps)
+        return remaining > 0, max(remaining, 0)
 
 
 def _record_invocation():
-    """Record a Claude invocation timestamp for rate limiting."""
-    now = time.time()
-    cutoff = now - 3600
+    """Record a Claude invocation timestamp for rate limiting. Thread-safe."""
+    with _state_lock:
+        now = time.time()
+        cutoff = now - 3600
 
-    timestamps = []
-    if RATE_LIMIT_FILE.exists():
-        try:
-            timestamps = json.loads(RATE_LIMIT_FILE.read_text())
-        except (json.JSONDecodeError, ValueError):
-            timestamps = []
+        timestamps = []
+        if RATE_LIMIT_FILE.exists():
+            try:
+                timestamps = json.loads(RATE_LIMIT_FILE.read_text())
+            except (json.JSONDecodeError, ValueError):
+                timestamps = []
 
-    timestamps = [t for t in timestamps if t > cutoff]
-    timestamps.append(now)
-    RATE_LIMIT_FILE.write_text(json.dumps(timestamps))
+        timestamps = [t for t in timestamps if t > cutoff]
+        timestamps.append(now)
+        RATE_LIMIT_FILE.write_text(json.dumps(timestamps))
+
+
+# ---------------------------------------------------------------------------
+# Inflight Tracking
+# ---------------------------------------------------------------------------
+
+
+def _is_inflight(ts: str) -> bool:
+    with _inflight_lock:
+        return ts in _inflight
+
+
+def _mark_inflight(ts: str):
+    with _inflight_lock:
+        _inflight.add(ts)
+
+
+def _unmark_inflight(ts: str):
+    with _inflight_lock:
+        _inflight.discard(ts)
+
+
+# ---------------------------------------------------------------------------
+# Async Invoke and Reply
+# ---------------------------------------------------------------------------
+
+
+def _async_invoke_and_reply(
+    token: str,
+    channel_id: str,
+    thread_ts: str,
+    msg_ts: str,
+    prompt: str,
+    session_id: str,
+    resume: bool,
+    on_success,
+    make_retry_prompt=None,
+):
+    """Process a Claude invocation in a background thread.
+
+    on_success(state, session_id) is called inside _state_lock to atomically
+    update state after a successful reply.
+    """
+    global _messages_processed
+    try:
+        _record_invocation()
+        start_time = time.time()
+        response = invoke_claude(prompt, session_id, resume=resume, thread_id=thread_ts)
+
+        # Retry fresh if resume failed
+        if resume and "[Claude exited with code" in response and make_retry_prompt:
+            log.warning("Resume failed for session %s, retrying fresh", session_id[:8])
+            session_id = str(uuid.uuid4())
+            response = invoke_claude(make_retry_prompt(), session_id, resume=False, thread_id=thread_ts)
+
+        elapsed = time.time() - start_time
+
+        # Build reply with optional @mention for slow tasks
+        if SLACK_USER_ID and elapsed >= SLACK_NOTIFY_THRESHOLD:
+            reply_text = f"{AGENT_PREFIX} <@{SLACK_USER_ID}> {response}"
+        else:
+            reply_text = f"{AGENT_PREFIX} {response}"
+
+        success = mcp_send_message(token, channel_id, thread_ts, reply_text)
+        if success:
+            log.info("Replied in %s thread %s (session=%s, %.1fs)", channel_id, thread_ts, session_id[:8], elapsed)
+            mcp_add_reaction(token, channel_id, msg_ts, "white_check_mark")
+            with _state_lock:
+                state = load_slack_state()
+                on_success(state, session_id)
+                save_slack_state(state)
+        else:
+            log.error("Failed to reply in %s thread %s", channel_id, thread_ts)
+
+        _messages_processed += 1
+    except Exception:
+        log.exception("Error in async invocation (session=%s)", session_id[:8])
+    finally:
+        _unmark_inflight(msg_ts)
 
 
 # ---------------------------------------------------------------------------
@@ -1651,7 +1741,6 @@ def load_slack_state() -> dict:
         "last_checked_ts": "",
         "active_threads": {},
         "search_processed_ids": [],
-        "cross_channel_threads": {},
     }
     if not SLACK_STATE_FILE.exists():
         return defaults
@@ -1751,8 +1840,8 @@ def slack_poll_cycle(token: str, state: dict):
         sum(1 for m in to_process if m["is_thread_reply"]),
     )
 
-    # 4. Process each message
-    replied = 0
+    # 4. Process each message (non-blocking via thread pool)
+    submitted = 0
     for msg in to_process:
         # Rate limit
         allowed, remaining = _check_rate_limit()
@@ -1768,6 +1857,10 @@ def slack_poll_cycle(token: str, state: dict):
         text = msg["text"]
         thread_ts = msg.get("thread_ts", msg["ts"]) if msg["is_thread_reply"] else msg["ts"]
 
+        # Skip if already being processed by another thread
+        if _is_inflight(msg["ts"]):
+            continue
+
         # Acknowledge receipt with eyes emoji
         mcp_add_reaction(token, channel_id, msg["ts"], "eyes")
 
@@ -1778,11 +1871,10 @@ def slack_poll_cycle(token: str, state: dict):
             session_id = thread_sessions[thread_ts]
         else:
             session_id = str(uuid.uuid4())
-        log.info("Processing (session=%s, resume=%s): %.80s", session_id[:8], resume, text)
+        log.info("Submitting (session=%s, resume=%s): %.80s", session_id[:8], resume, text)
 
         # Build prompt for Claude
         if resume:
-            # Resumed session already has context; just send the new message
             prompt = text
         elif msg["is_thread_reply"]:
             thread_context = msg.get("thread_context", "")
@@ -1804,99 +1896,71 @@ def slack_poll_cycle(token: str, state: dict):
                 f"Be concise and helpful."
             )
 
-        _record_invocation()
-        start_time = time.time()
-        response = invoke_claude(prompt, session_id, resume=resume, thread_id=thread_ts)
-
-        # If resume failed, retry fresh with full thread context
-        if resume and "[Claude exited with code" in response:
-            log.warning("Resume failed for Slack session %s, retrying fresh", session_id[:8])
-            session_id = str(uuid.uuid4())
-            thread_context = msg.get("thread_context", "")
-            if thread_context:
-                prompt = (
+        # Build retry prompt for resume failures
+        _thread_context = msg.get("thread_context", "")
+        _msg_text = text
+        def _make_retry(tc=_thread_context, tx=_msg_text):
+            if tc:
+                return (
                     f"You are an AI assistant replying in a Slack thread. "
-                    f"Here is the full thread context:\n\n{thread_context}\n\n"
-                    f"The latest message is: {text}\n\n"
+                    f"Here is the full thread context:\n\n{tc}\n\n"
+                    f"The latest message is: {tx}\n\n"
                     f"Respond to this latest message. Use Slack mrkdwn formatting "
                     f"(*bold*, _italic_, `code`). Be concise and helpful. "
                     f"Use all available MCP tools if needed."
                 )
-            else:
-                prompt = (
-                    f"You are an AI assistant responding to a Slack message. "
-                    f"The message is: {text}\n\n"
-                    f"Process this as a task. Use all available MCP tools "
-                    f"(Slack, Google Workspace, Glean, etc.) as needed. "
-                    f"Use Slack mrkdwn formatting (*bold*, _italic_, `code`). "
-                    f"Be concise and helpful."
-                )
-            response = invoke_claude(prompt, session_id, resume=False, thread_id=thread_ts)
-        elapsed = time.time() - start_time
+            return (
+                f"You are an AI assistant responding to a Slack message. "
+                f"The message is: {tx}\n\n"
+                f"Process this as a task. Use all available MCP tools "
+                f"(Slack, Google Workspace, Glean, etc.) as needed. "
+                f"Use Slack mrkdwn formatting (*bold*, _italic_, `code`). "
+                f"Be concise and helpful."
+            )
 
-        # Post reply - @mention user if task took longer than threshold
-        if SLACK_USER_ID and elapsed >= SLACK_NOTIFY_THRESHOLD:
-            reply_text = f"{AGENT_PREFIX} <@{SLACK_USER_ID}> {response}"
-        else:
-            reply_text = f"{AGENT_PREFIX} {response}"
-        success = mcp_send_message(token, channel_id, thread_ts, reply_text)
+        # State update callback (runs inside _state_lock in the thread)
+        _thread_ts = thread_ts
+        _msg_ts = msg["ts"]
+        def _on_success(st, sid, tts=_thread_ts, mts=_msg_ts):
+            st.setdefault("active_threads", {})[tts] = mts
+            st.setdefault("thread_sessions", {})[tts] = sid
 
-        if success:
-            replied += 1
-            log.info("Replied to message %s (session=%s)", msg["ts"], session_id[:8])
-            # Mark done with checkmark
-            mcp_add_reaction(token, channel_id, msg["ts"], "white_check_mark")
-            # Track thread and session
-            active_threads[thread_ts] = msg["ts"]
-            thread_sessions[thread_ts] = session_id
-            state["thread_sessions"] = thread_sessions
-        else:
-            log.error("Failed to reply to message %s", msg["ts"])
+        _mark_inflight(msg["ts"])
+        _executor.submit(
+            _async_invoke_and_reply,
+            token, channel_id, thread_ts, msg["ts"],
+            prompt, session_id, resume, _on_success, _make_retry,
+        )
+        submitted += 1
 
-        _messages_processed += 1
-
-    # 5. Update state
+    # 5. Update state (thread-safe: re-read state under lock)
     newest_top_ts = last_ts
     for msg in new_top_level:
         if float(msg.get("ts", "0")) > float(newest_top_ts):
             newest_top_ts = msg["ts"]
-    if newest_top_ts != last_ts:
-        state["last_checked_ts"] = newest_top_ts
-
-    # Update thread tracking
-    for msg in to_process:
-        if msg["is_thread_reply"]:
-            thread_ts = msg["thread_ts"]
-            active_threads[thread_ts] = msg["ts"]
-        else:
-            active_threads[msg["ts"]] = msg["ts"]
 
     # Prune stale threads (>7 days)
     cutoff = time.time() - 7 * 86400
-    pruned_threads = {
-        k for k, v in active_threads.items()
-        if float(v) <= cutoff
-    }
-    active_threads = {
-        k: v for k, v in active_threads.items()
-        if k not in pruned_threads
-    }
-    thread_sessions = state.get("thread_sessions", {})
-    for thread_ts in pruned_threads:
-        session_id = thread_sessions.pop(thread_ts, None)
-        if session_id:
-            delete_claude_session(session_id)
-    thread_sessions = {
-        k: v for k, v in thread_sessions.items()
-        if k in active_threads
-    }
+    pruned_sessions = []
+    for k, v in list(active_threads.items()):
+        if float(v) <= cutoff:
+            sid = state.get("thread_sessions", {}).get(k)
+            if sid:
+                pruned_sessions.append((k, sid))
 
-    state["active_threads"] = active_threads
-    state["thread_sessions"] = thread_sessions
-    state["thread_failures"] = thread_failures
-    save_slack_state(state)
+    with _state_lock:
+        state = load_slack_state()
+        if newest_top_ts != last_ts:
+            state["last_checked_ts"] = newest_top_ts
+        state["thread_failures"] = thread_failures
+        # Prune stale threads
+        for k, sid in pruned_sessions:
+            state.get("active_threads", {}).pop(k, None)
+            state.get("thread_sessions", {}).pop(k, None)
+            delete_claude_session(sid)
+        save_slack_state(state)
 
-    log.info("Processed %d, replied to %d", len(to_process), replied)
+    log.info("Submitted %d messages to thread pool", submitted)
 
 
 # ---------------------------------------------------------------------------
@@ -1905,9 +1969,12 @@ def slack_poll_cycle(token: str, state: dict):
 
 
 def slack_cross_channel_cycle(token: str, state: dict):
-    """Search for @ClaudeRemote mentions across all channels and process them."""
-    global _messages_processed
+    """Search for @ClaudeRemote mentions across all channels and process them.
 
+    Only explicit @ClaudeRemote mentions are processed - no implicit thread
+    follow-ups. Each invocation is submitted to the thread pool for concurrent
+    execution.
+    """
     if not CROSS_CHANNEL_ENABLED or not SLACK_USER_ID:
         return
 
@@ -1925,7 +1992,6 @@ def slack_cross_channel_cycle(token: str, state: dict):
     # 2. Filter out messages we shouldn't process
     private_channel_id = state.get("channel_id", "")
     processed = set(state.get("search_processed_ids", []))
-    cross_threads = state.get("cross_channel_threads", {})
 
     to_process = []
     for msg in results:
@@ -1936,8 +2002,8 @@ def slack_cross_channel_cycle(token: str, state: dict):
         # Skip private channel (handled by existing poll)
         if msg.get("channel_id") == private_channel_id:
             continue
-        # Skip already processed
-        if msg.get("ts") in processed:
+        # Skip already processed or inflight
+        if msg.get("ts") in processed or _is_inflight(msg.get("ts", "")):
             continue
         # Skip agent replies
         if AGENT_PREFIX in msg.get("text", ""):
@@ -1947,10 +2013,12 @@ def slack_cross_channel_cycle(token: str, state: dict):
             continue
         to_process.append(msg)
 
-    if to_process:
-        log.info("Cross-channel: found %d new @ClaudeRemote mentions", len(to_process))
+    if not to_process:
+        return
 
-    # 3. Process each new mention
+    log.info("Cross-channel: found %d new @ClaudeRemote mentions", len(to_process))
+
+    # 3. Submit each to thread pool
     for msg in to_process:
         allowed, remaining = _check_rate_limit()
         if not allowed:
@@ -1969,17 +2037,10 @@ def slack_cross_channel_cycle(token: str, state: dict):
         # Acknowledge receipt
         mcp_add_reaction(token, channel_id, msg["ts"], "eyes")
 
-        # Session management - reuse session if replying in same thread
-        key = f"{channel_id}:{thread_ts}"
-        resume = key in cross_threads
-        if resume:
-            session_id = cross_threads[key]["session_id"]
-        else:
-            session_id = str(uuid.uuid4())
-
+        session_id = str(uuid.uuid4())
         log.info(
-            "Cross-channel processing (channel=%s, session=%s, resume=%s): %.80s",
-            channel_id, session_id[:8], resume, text,
+            "Cross-channel submitting (channel=%s, session=%s): %.80s",
+            channel_id, session_id[:8], text,
         )
 
         # Build prompt with posting scope restriction
@@ -1987,139 +2048,48 @@ def slack_cross_channel_cycle(token: str, state: dict):
             f"SLACK POSTING RULE: Only post to channel {channel_id}, "
             f"thread {thread_ts}. Do NOT post to any other channel."
         )
-        if resume:
-            prompt = f"{no_post_rule}\n\n{text}"
-        else:
-            prompt = (
-                f"{no_post_rule}\n\n"
+        prompt = (
+            f"{no_post_rule}\n\n"
+            f"You are an AI assistant responding to a Slack message. "
+            f"The message is: {text}\n\n"
+            f"Process this as a task. Use all available MCP tools "
+            f"(Slack, Google Workspace, Glean, etc.) as needed. "
+            f"Use Slack mrkdwn formatting (*bold*, _italic_, `code`). "
+            f"Be concise and helpful."
+        )
+
+        _msg_ts = msg["ts"]
+        def _on_success(st, sid, mts=_msg_ts):
+            ids = set(st.get("search_processed_ids", []))
+            ids.add(mts)
+            st["search_processed_ids"] = list(ids)[-500:]
+
+        def _make_retry(t=text, npr=no_post_rule):
+            return (
+                f"{npr}\n\n"
                 f"You are an AI assistant responding to a Slack message. "
-                f"The message is: {text}\n\n"
+                f"The message is: {t}\n\n"
                 f"Process this as a task. Use all available MCP tools "
                 f"(Slack, Google Workspace, Glean, etc.) as needed. "
                 f"Use Slack mrkdwn formatting (*bold*, _italic_, `code`). "
                 f"Be concise and helpful."
             )
-
-        _record_invocation()
-        start_time = time.time()
-        response = invoke_claude(prompt, session_id, resume=resume, thread_id=thread_ts)
-
-        # If resume failed, retry fresh
-        if resume and "[Claude exited with code" in response:
-            log.warning("Cross-channel resume failed for session %s, retrying fresh", session_id[:8])
-            session_id = str(uuid.uuid4())
-            prompt = (
-                f"{no_post_rule}\n\n"
-                f"You are an AI assistant responding to a Slack message. "
-                f"The message is: {text}\n\n"
-                f"Process this as a task. Use all available MCP tools "
-                f"(Slack, Google Workspace, Glean, etc.) as needed. "
-                f"Use Slack mrkdwn formatting (*bold*, _italic_, `code`). "
-                f"Be concise and helpful."
-            )
-            response = invoke_claude(prompt, session_id, resume=False, thread_id=thread_ts)
-        elapsed = time.time() - start_time
-
-        # Post reply - @mention user if task took longer than threshold
-        if SLACK_USER_ID and elapsed >= SLACK_NOTIFY_THRESHOLD:
-            reply_text = f"{AGENT_PREFIX} <@{SLACK_USER_ID}> {response}"
-        else:
-            reply_text = f"{AGENT_PREFIX} {response}"
-
-        success = mcp_send_message(token, channel_id, thread_ts, reply_text)
-        if success:
-            log.info("Cross-channel replied to %s in %s (session=%s)", msg["ts"], channel_id, session_id[:8])
-            mcp_add_reaction(token, channel_id, msg["ts"], "white_check_mark")
-            cross_threads[key] = {
-                "channel_id": channel_id,
-                "thread_ts": thread_ts,
-                "last_reply_ts": msg["ts"],
-                "session_id": session_id,
-            }
-        else:
-            log.error("Cross-channel failed to reply to %s in %s", msg["ts"], channel_id)
 
         processed.add(msg["ts"])
-        _messages_processed += 1
+        _mark_inflight(msg["ts"])
+        _executor.submit(
+            _async_invoke_and_reply,
+            token, channel_id, thread_ts, msg["ts"],
+            prompt, session_id, False, _on_success, _make_retry,
+        )
 
-    # 4. Check cross-channel threads for follow-up replies
-    for key, thread_info in list(cross_threads.items()):
-        channel_id = thread_info["channel_id"]
-        thread_ts = thread_info["thread_ts"]
-        last_reply_ts = thread_info["last_reply_ts"]
-        session_id = thread_info["session_id"]
-
-        thread_text = mcp_read_thread(token, channel_id, thread_ts)
-        if thread_text is None:
-            continue
-
-        replies = parse_thread_replies(thread_text, last_reply_ts)
-        for reply in replies:
-            # Skip agent output and MCP-tool-posted messages
-            if not should_process(reply):
-                continue
-            # Only process replies from allowed users
-            allowed_users = CROSS_CHANNEL_ALLOWED_USERS | {SLACK_USER_ID}
-            if reply.get("user") not in allowed_users:
-                continue
-            # Skip if already processed as a new @ClaudeRemote mention
-            if reply.get("ts") in processed:
-                continue
-
-            allowed, _ = _check_rate_limit()
-            if not allowed:
-                break
-
-            text = reply["text"]
-            mcp_add_reaction(token, channel_id, reply["ts"], "eyes")
-
-            no_post_rule = (
-                f"SLACK POSTING RULE: Only post to channel {channel_id}, "
-                f"thread {thread_ts}. Do NOT post to any other channel."
-            )
-            prompt = f"{no_post_rule}\n\n{text}"
-
-            log.info("Cross-channel thread reply (session=%s): %.80s", session_id[:8], text)
-            _record_invocation()
-            start_time = time.time()
-            response = invoke_claude(prompt, session_id, resume=True, thread_id=thread_ts)
-
-            if "[Claude exited with code" in response:
-                session_id = str(uuid.uuid4())
-                prompt = (
-                    f"{no_post_rule}\n\n"
-                    f"You are an AI assistant replying in a Slack thread. "
-                    f"Here is the full thread context:\n\n{thread_text}\n\n"
-                    f"The latest message is: {text}\n\n"
-                    f"Respond to this latest message. Use Slack mrkdwn formatting "
-                    f"(*bold*, _italic_, `code`). Be concise and helpful. "
-                    f"Use all available MCP tools if needed."
-                )
-                response = invoke_claude(prompt, session_id, resume=False, thread_id=thread_ts)
-            elapsed = time.time() - start_time
-
-            if SLACK_USER_ID and elapsed >= SLACK_NOTIFY_THRESHOLD:
-                reply_text = f"{AGENT_PREFIX} <@{SLACK_USER_ID}> {response}"
-            else:
-                reply_text = f"{AGENT_PREFIX} {response}"
-
-            success = mcp_send_message(token, channel_id, thread_ts, reply_text)
-            if success:
-                mcp_add_reaction(token, channel_id, reply["ts"], "white_check_mark")
-                cross_threads[key]["last_reply_ts"] = reply["ts"]
-                cross_threads[key]["session_id"] = session_id
-            _messages_processed += 1
-
-    # 5. Prune old entries (>7 days) and save state
-    cutoff = time.time() - 7 * 86400
-    cross_threads = {
-        k: v for k, v in cross_threads.items()
-        if float(v.get("last_reply_ts", "0")) > cutoff
-    }
-
-    state["search_processed_ids"] = list(processed)[-500:]  # keep last 500
-    state["cross_channel_threads"] = cross_threads
-    save_slack_state(state)
+    # 4. Save processed IDs
+    with _state_lock:
+        state = load_slack_state()
+        existing = set(state.get("search_processed_ids", []))
+        existing.update(processed)
+        state["search_processed_ids"] = list(existing)[-500:]
+        save_slack_state(state)
 
 
 # ---------------------------------------------------------------------------
@@ -2129,10 +2099,11 @@ def slack_cross_channel_cycle(token: str, state: dict):
 
 def run_bridge(foreground: bool = False, gmail_enabled: bool = True, slack_enabled: bool = False):
     """Main loop: poll Gmail and/or Slack, process messages, reply."""
-    global _startup_time, _messages_processed
+    global _startup_time, _messages_processed, _executor
     setup_logging(foreground=foreground)
     _messages_processed = 0
     _startup_time = datetime.now(timezone.utc)
+    _executor = ThreadPoolExecutor(max_workers=MAX_CONCURRENT_INVOCATIONS, thread_name_prefix="claude")
 
     transports = []
     if gmail_enabled:
@@ -2270,6 +2241,8 @@ def run_bridge(foreground: bool = False, gmail_enabled: bool = True, slack_enabl
                 break
             time.sleep(1)
 
+    log.info("Waiting for in-flight invocations to complete...")
+    _executor.shutdown(wait=True)
     log.info("ClaudeRemote stopped")
 
 

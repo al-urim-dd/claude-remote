@@ -967,14 +967,13 @@ hello
 class TestCrossChannelFiltering:
     """Tests for cross-channel message filtering logic."""
 
-    def _make_state(self, channel_id="CPRIVATE", processed=None, cross_threads=None):
+    def _make_state(self, channel_id="CPRIVATE", processed=None):
         return {
             "channel_id": channel_id,
             "channel_name": "private-chan",
             "last_checked_ts": "0",
             "active_threads": {},
             "search_processed_ids": processed or [],
-            "cross_channel_threads": cross_threads or {},
         }
 
     def test_skips_other_users(self, tmp_config):
@@ -1061,19 +1060,20 @@ Text:
 ---
 """
         state = self._make_state()
+        mock_executor = mock.MagicMock()
         with mock.patch.object(bridge, "SLACK_STATE_FILE", tmp_config / "slack_state.json"), \
              mock.patch.object(bridge, "CROSS_CHANNEL_ENABLED", True), \
              mock.patch.object(bridge, "SLACK_USER_ID", "U0264PUMBD5"), \
+             mock.patch.object(bridge, "_executor", mock_executor), \
              mock.patch("bridge.mcp_search_messages", return_value=search_output), \
-             mock.patch("bridge.invoke_claude", return_value="Done!") as mock_invoke, \
-             mock.patch("bridge.mcp_send_message", return_value=True), \
              mock.patch("bridge.mcp_add_reaction", return_value=True), \
-             mock.patch("bridge._check_rate_limit", return_value=(True, 19)), \
-             mock.patch("bridge._record_invocation"):
+             mock.patch("bridge._check_rate_limit", return_value=(True, 19)):
             bridge.slack_cross_channel_cycle("fake-token", state)
-            # The prompt should contain "fix this bug" but not the trigger
-            call_args = mock_invoke.call_args
-            prompt = call_args[0][0]
+            # Verify executor.submit was called with the prompt
+            mock_executor.submit.assert_called_once()
+            call_args = mock_executor.submit.call_args
+            # _async_invoke_and_reply args: token, channel_id, thread_ts, msg_ts, prompt, ...
+            prompt = call_args[0][5]  # 6th positional arg is the prompt
             assert "fix this bug" in prompt
             assert "@ClaudeRemote" not in prompt
 
