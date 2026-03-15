@@ -129,6 +129,11 @@ SLACK_NOTIFY_THRESHOLD = int(os.environ.get("CLAUDE_REMOTE_NOTIFY_THRESHOLD", "3
 # Cross-channel invocation via @ClaudeRemote keyword search
 CROSS_CHANNEL_ENABLED = os.environ.get("CLAUDE_REMOTE_CROSS_CHANNEL", "true").lower() == "true"
 CROSS_CHANNEL_TRIGGER = os.environ.get("CLAUDE_REMOTE_TRIGGER", "@ClaudeRemote")
+# Comma-separated list of user IDs allowed to trigger via @ClaudeRemote (in addition to SLACK_USER_ID)
+_extra_users = os.environ.get("CLAUDE_REMOTE_ALLOWED_USERS", "")
+CROSS_CHANNEL_ALLOWED_USERS: set[str] = {
+    uid.strip() for uid in _extra_users.split(",") if uid.strip()
+}
 
 # Module-level state (set in run_bridge)
 _startup_time: Optional[datetime] = None
@@ -1924,8 +1929,9 @@ def slack_cross_channel_cycle(token: str, state: dict):
 
     to_process = []
     for msg in results:
-        # Security: only process messages from the bridge owner
-        if msg.get("user_id") != SLACK_USER_ID:
+        # Security: only process messages from allowed users
+        allowed_users = CROSS_CHANNEL_ALLOWED_USERS | {SLACK_USER_ID}
+        if msg.get("user_id") not in allowed_users:
             continue
         # Skip private channel (handled by existing poll)
         if msg.get("channel_id") == private_channel_id:
@@ -2052,8 +2058,9 @@ def slack_cross_channel_cycle(token: str, state: dict):
             # Skip agent output and MCP-tool-posted messages
             if not should_process(reply):
                 continue
-            # Only process replies from the bridge owner
-            if reply.get("user") != SLACK_USER_ID:
+            # Only process replies from allowed users
+            allowed_users = CROSS_CHANNEL_ALLOWED_USERS | {SLACK_USER_ID}
+            if reply.get("user") not in allowed_users:
                 continue
             # Skip if already processed as a new @ClaudeRemote mention
             if reply.get("ts") in processed:
