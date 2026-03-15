@@ -1908,7 +1908,7 @@ def slack_cross_channel_cycle(token: str, state: dict):
 
     # 1. Search for trigger mentions from today
     today = datetime.now().strftime("%Y-%m-%d")
-    query = f"{CROSS_CHANNEL_TRIGGER} after:{today}"
+    query = f"{CROSS_CHANNEL_TRIGGER} on:{today}"
     search_text = mcp_search_messages(token, query)
     if not search_text:
         return
