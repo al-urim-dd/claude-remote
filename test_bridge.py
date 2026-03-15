@@ -460,28 +460,30 @@ class TestDailyDigest:
 
         mock_service.users().messages().send.assert_not_called()
 
-    def test_digest_invokes_brief_skill(self, tmp_config):
-        """Digest should invoke the /brief skill via _invoke_skill."""
+    def test_digest_invokes_daily_brief_skill(self, tmp_config):
+        """Digest should invoke the /daily-brief skill via _invoke_skill."""
         mock_service = mock.MagicMock()
         send_mock = mock_service.users.return_value.messages.return_value.send
         send_mock.return_value.execute.return_value = {"id": "d1"}
 
-        with mock.patch.object(bridge, "_invoke_skill", return_value="# Morning Brief\nTest content") as mock_skill:
+        with mock.patch.object(bridge, "_skill_exists", return_value=True), \
+             mock.patch.object(bridge, "_invoke_skill", return_value="# Morning Brief\nTest content") as mock_skill:
             bridge.send_daily_digest(mock_service, "me@test.com", {}, 0)
 
-        mock_skill.assert_called_once_with("brief")
+        mock_skill.assert_called_once_with("daily-brief")
         send_mock.assert_called_once()
 
-    def test_summary_invokes_summary_skill(self, tmp_config):
-        """Work summary should invoke the /summary skill."""
+    def test_summary_invokes_daily_summary_skill(self, tmp_config):
+        """Work summary should invoke the /daily-summary skill."""
         mock_service = mock.MagicMock()
         send_mock = mock_service.users.return_value.messages.return_value.send
         send_mock.return_value.execute.return_value = {"id": "d1"}
 
-        with mock.patch.object(bridge, "_invoke_skill", return_value="# Summary\nTest") as mock_skill:
+        with mock.patch.object(bridge, "_skill_exists", return_value=True), \
+             mock.patch.object(bridge, "_invoke_skill", return_value="# Summary\nTest") as mock_skill:
             bridge.send_work_summary(mock_service, "me@test.com")
 
-        mock_skill.assert_called_once_with("summary")
+        mock_skill.assert_called_once_with("daily-summary")
         send_mock.assert_called_once()
 
 

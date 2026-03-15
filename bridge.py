@@ -95,8 +95,8 @@ Available commands and capabilities:
 /sessions -- List recent Claude Code sessions
 /resume <session-id> -- Resume a specific session
 /cancel -- Cancel a running task (coming soon)
-/summary -- Generate and send a work summary for today
-/brief -- Morning briefing with TODOs, calendar, PRs, email, Slack
+/daily-summary -- Generate and send a work summary for today
+/daily-brief -- Morning briefing with TODOs, calendar, PRs, email, Slack
 
 Regular messages -- Sent to Claude Code for processing
 Attachments -- Attach files to emails and Claude will analyze them
@@ -848,7 +848,7 @@ def _send_scheduled_email(service, my_email: str, subject: str, body: str):
 
 
 def send_daily_digest(service, my_email: str, thread_sessions: dict, processed_count: int):
-    """Send a morning briefing by invoking the /brief skill."""
+    """Send a morning briefing by invoking the /daily-brief skill."""
     now = datetime.now()
 
     if DIGEST_LAST_SENT_FILE.exists():
@@ -856,12 +856,12 @@ def send_daily_digest(service, my_email: str, thread_sessions: dict, processed_c
         if last_sent == now.strftime("%Y-%m-%d"):
             return
 
-    if not _skill_exists("brief"):
-        log.debug("Skipping morning briefing: /brief skill not installed")
+    if not _skill_exists("daily-brief"):
+        log.debug("Skipping morning briefing: /daily-brief skill not installed")
         return
 
-    log.info("Generating morning briefing via /brief skill")
-    body = _invoke_skill("brief")
+    log.info("Generating morning briefing via /daily-brief skill")
+    body = _invoke_skill("daily-brief")
 
     if not body or body.startswith("["):
         log.warning("Morning briefing failed: %s", body[:100] if body else "empty")
@@ -891,7 +891,7 @@ def _maybe_send_digest(service, my_email, thread_sessions, processed_count):
 
 
 def send_work_summary(service, my_email: str):
-    """Send an end-of-day work summary by invoking the /summary skill."""
+    """Send an end-of-day work summary by invoking the /daily-summary skill."""
     now = datetime.now()
 
     if SUMMARY_LAST_SENT_FILE.exists():
@@ -906,12 +906,12 @@ def send_work_summary(service, my_email: str):
         except ValueError:
             pass
 
-    if not _skill_exists("summary"):
-        log.debug("Skipping work summary: /summary skill not installed")
+    if not _skill_exists("daily-summary"):
+        log.debug("Skipping work summary: /daily-summary skill not installed")
         return
 
-    log.info("Generating work summary via /summary skill")
-    body = _invoke_skill("summary")
+    log.info("Generating work summary via /daily-summary skill")
+    body = _invoke_skill("daily-summary")
 
     if not body or body.startswith("["):
         log.warning("Work summary failed: %s", body[:100] if body else "empty")
@@ -1044,35 +1044,35 @@ def gmail_poll_cycle(
             processed_ids.add(msg_id)
             save_processed_id(msg_id)
             continue
-        if body.lower() == "/summary":
-            if not _skill_exists("summary"):
-                response = "The /summary skill is not installed. Create it at ~/.claude/skills/summary/"
+        if body.lower() == "/daily-summary":
+            if not _skill_exists("daily-summary"):
+                response = "The /daily-summary skill is not installed. Create it at ~/.claude/commands/daily-summary.md"
                 send_reply(service, msg, response, my_email)
                 mark_as_read(service, msg_id)
                 processed_ids.add(msg_id)
                 save_processed_id(msg_id)
                 continue
-            log.info("Manual work summary requested via /summary skill")
-            response = _invoke_skill("summary")
+            log.info("Manual work summary requested via /daily-summary skill")
+            response = _invoke_skill("daily-summary")
             summary_sent = send_reply(service, msg, response, my_email)
             if summary_sent and "id" in summary_sent:
                 processed_ids.add(summary_sent["id"])
                 save_processed_id(summary_sent["id"])
-            # Don't mark auto-summary as sent - manual /summary is on-demand
+            # Don't mark auto-summary as sent - manual /daily-summary is on-demand
             mark_as_read(service, msg_id)
             processed_ids.add(msg_id)
             save_processed_id(msg_id)
             continue
-        if body.lower() == "/brief":
-            if not _skill_exists("brief"):
-                response = "The /brief skill is not installed. Create it at ~/.claude/skills/brief/"
+        if body.lower() == "/daily-brief":
+            if not _skill_exists("daily-brief"):
+                response = "The /daily-brief skill is not installed. Create it at ~/.claude/commands/daily-brief.md"
                 send_reply(service, msg, response, my_email)
                 mark_as_read(service, msg_id)
                 processed_ids.add(msg_id)
                 save_processed_id(msg_id)
                 continue
-            log.info("Manual morning brief requested via /brief skill")
-            response = _invoke_skill("brief")
+            log.info("Manual morning brief requested via /daily-brief skill")
+            response = _invoke_skill("daily-brief")
             brief_sent = send_reply(service, msg, response, my_email)
             if brief_sent and "id" in brief_sent:
                 processed_ids.add(brief_sent["id"])
