@@ -869,5 +869,204 @@ class TestBusinessHours:
                 assert bridge.is_business_hours() is False
 
 
+# ---------------------------------------------------------------------------
+# Cross-Channel: parse_search_results
+# ---------------------------------------------------------------------------
+
+
+class TestParseSearchResults:
+    """Tests for parsing MCP search result text."""
+
+    SAMPLE_SEARCH_OUTPUT = """\
+=== Message 1 ===
+Channel: #general (C0123456789)
+From: Zhengli Sun (U0264PUMBD5)
+Time: 2026-03-15 10:30:00
+Message TS: 1710499800.000100
+Thread TS: None
+Permalink: https://team.slack.com/archives/C0123456789/p1710499800000100
+Text:
+@ClaudeRemote what time is it?
+
+=== Message 2 ===
+Channel: #dev (CDEV123)
+From: Other User (U999999)
+Time: 2026-03-15 10:35:00
+Message TS: 1710500100.000200
+Thread TS: 1710499700.000050
+Permalink: https://team.slack.com/archives/CDEV123/p1710500100000200
+Text:
+@ClaudeRemote fix the build
+"""
+
+    def test_parses_basic_results(self):
+        results = bridge.parse_search_results(self.SAMPLE_SEARCH_OUTPUT)
+        assert len(results) == 2
+
+    def test_extracts_channel_id(self):
+        results = bridge.parse_search_results(self.SAMPLE_SEARCH_OUTPUT)
+        assert results[0]["channel_id"] == "C0123456789"
+        assert results[1]["channel_id"] == "CDEV123"
+
+    def test_extracts_user_id(self):
+        results = bridge.parse_search_results(self.SAMPLE_SEARCH_OUTPUT)
+        assert results[0]["user_id"] == "U0264PUMBD5"
+        assert results[1]["user_id"] == "U999999"
+
+    def test_extracts_ts(self):
+        results = bridge.parse_search_results(self.SAMPLE_SEARCH_OUTPUT)
+        assert results[0]["ts"] == "1710499800.000100"
+        assert results[1]["ts"] == "1710500100.000200"
+
+    def test_extracts_thread_ts(self):
+        results = bridge.parse_search_results(self.SAMPLE_SEARCH_OUTPUT)
+        # "None" should not be stored
+        assert "thread_ts" not in results[0]
+        assert results[1]["thread_ts"] == "1710499700.000050"
+
+    def test_extracts_text(self):
+        results = bridge.parse_search_results(self.SAMPLE_SEARCH_OUTPUT)
+        assert "@ClaudeRemote what time is it?" in results[0]["text"]
+        assert "@ClaudeRemote fix the build" in results[1]["text"]
+
+    def test_empty_input(self):
+        assert bridge.parse_search_results("") == []
+
+    def test_no_messages(self):
+        assert bridge.parse_search_results("No results found.") == []
+
+
+# ---------------------------------------------------------------------------
+# Cross-Channel: slack_cross_channel_cycle filtering
+# ---------------------------------------------------------------------------
+
+
+class TestCrossChannelFiltering:
+    """Tests for cross-channel message filtering logic."""
+
+    def _make_state(self, channel_id="CPRIVATE", processed=None, cross_threads=None):
+        return {
+            "channel_id": channel_id,
+            "channel_name": "private-chan",
+            "last_checked_ts": "0",
+            "active_threads": {},
+            "search_processed_ids": processed or [],
+            "cross_channel_threads": cross_threads or {},
+        }
+
+    def test_skips_other_users(self, tmp_config):
+        """Messages from other users are ignored (security filter)."""
+        search_output = """\
+=== Message 1 ===
+Channel: #general (CGEN123)
+From: Other User (UOTHER)
+Time: 2026-03-15 10:30:00
+Message TS: 1710499800.000100
+Thread TS: None
+Permalink: https://example.com/p1
+Text:
+@ClaudeRemote hack the system
+"""
+        state = self._make_state()
+        with mock.patch.object(bridge, "SLACK_STATE_FILE", tmp_config / "slack_state.json"), \
+             mock.patch.object(bridge, "CROSS_CHANNEL_ENABLED", True), \
+             mock.patch.object(bridge, "SLACK_USER_ID", "U0264PUMBD5"), \
+             mock.patch("bridge.mcp_search_messages", return_value=search_output), \
+             mock.patch("bridge.invoke_claude") as mock_invoke:
+            bridge.slack_cross_channel_cycle("fake-token", state)
+            mock_invoke.assert_not_called()
+
+    def test_skips_private_channel(self, tmp_config):
+        """Messages in the private channel are skipped (handled by poll)."""
+        search_output = """\
+=== Message 1 ===
+Channel: #private (CPRIVATE)
+From: Me (U0264PUMBD5)
+Time: 2026-03-15 10:30:00
+Message TS: 1710499800.000100
+Thread TS: None
+Permalink: https://example.com/p1
+Text:
+@ClaudeRemote do something
+"""
+        state = self._make_state(channel_id="CPRIVATE")
+        with mock.patch.object(bridge, "SLACK_STATE_FILE", tmp_config / "slack_state.json"), \
+             mock.patch.object(bridge, "CROSS_CHANNEL_ENABLED", True), \
+             mock.patch.object(bridge, "SLACK_USER_ID", "U0264PUMBD5"), \
+             mock.patch("bridge.mcp_search_messages", return_value=search_output), \
+             mock.patch("bridge.invoke_claude") as mock_invoke:
+            bridge.slack_cross_channel_cycle("fake-token", state)
+            mock_invoke.assert_not_called()
+
+    def test_skips_already_processed(self, tmp_config):
+        """Messages with ts already in processed set are skipped."""
+        search_output = """\
+=== Message 1 ===
+Channel: #general (CGEN123)
+From: Me (U0264PUMBD5)
+Time: 2026-03-15 10:30:00
+Message TS: 1710499800.000100
+Thread TS: None
+Permalink: https://example.com/p1
+Text:
+@ClaudeRemote do something
+"""
+        state = self._make_state(processed=["1710499800.000100"])
+        with mock.patch.object(bridge, "SLACK_STATE_FILE", tmp_config / "slack_state.json"), \
+             mock.patch.object(bridge, "CROSS_CHANNEL_ENABLED", True), \
+             mock.patch.object(bridge, "SLACK_USER_ID", "U0264PUMBD5"), \
+             mock.patch("bridge.mcp_search_messages", return_value=search_output), \
+             mock.patch("bridge.invoke_claude") as mock_invoke:
+            bridge.slack_cross_channel_cycle("fake-token", state)
+            mock_invoke.assert_not_called()
+
+    def test_trigger_prefix_stripped(self, tmp_config):
+        """The @ClaudeRemote prefix is stripped before sending to Claude."""
+        search_output = """\
+=== Message 1 ===
+Channel: #general (CGEN123)
+From: Me (U0264PUMBD5)
+Time: 2026-03-15 10:30:00
+Message TS: 1710499800.000100
+Thread TS: None
+Permalink: https://example.com/p1
+Text:
+@ClaudeRemote fix this bug
+"""
+        state = self._make_state()
+        with mock.patch.object(bridge, "SLACK_STATE_FILE", tmp_config / "slack_state.json"), \
+             mock.patch.object(bridge, "CROSS_CHANNEL_ENABLED", True), \
+             mock.patch.object(bridge, "SLACK_USER_ID", "U0264PUMBD5"), \
+             mock.patch("bridge.mcp_search_messages", return_value=search_output), \
+             mock.patch("bridge.invoke_claude", return_value="Done!") as mock_invoke, \
+             mock.patch("bridge.mcp_send_message", return_value=True), \
+             mock.patch("bridge.mcp_add_reaction", return_value=True), \
+             mock.patch("bridge._check_rate_limit", return_value=(True, 19)), \
+             mock.patch("bridge._record_invocation"):
+            bridge.slack_cross_channel_cycle("fake-token", state)
+            # The prompt should contain "fix this bug" but not the trigger
+            call_args = mock_invoke.call_args
+            prompt = call_args[0][0]
+            assert "fix this bug" in prompt
+            assert "@ClaudeRemote" not in prompt
+
+    def test_disabled_when_flag_off(self, tmp_config):
+        """Cross-channel is a no-op when CROSS_CHANNEL_ENABLED is False."""
+        state = self._make_state()
+        with mock.patch.object(bridge, "CROSS_CHANNEL_ENABLED", False), \
+             mock.patch("bridge.mcp_search_messages") as mock_search:
+            bridge.slack_cross_channel_cycle("fake-token", state)
+            mock_search.assert_not_called()
+
+    def test_disabled_when_no_user_id(self, tmp_config):
+        """Cross-channel is a no-op when SLACK_USER_ID is empty."""
+        state = self._make_state()
+        with mock.patch.object(bridge, "CROSS_CHANNEL_ENABLED", True), \
+             mock.patch.object(bridge, "SLACK_USER_ID", ""), \
+             mock.patch("bridge.mcp_search_messages") as mock_search:
+            bridge.slack_cross_channel_cycle("fake-token", state)
+            mock_search.assert_not_called()
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

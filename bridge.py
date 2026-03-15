@@ -126,6 +126,10 @@ SLACK_CHANNEL_NAME = os.environ.get("CLAUDE_REMOTE_SLACK_CHANNEL", "zhengli-agen
 SLACK_USER_ID = os.environ.get("CLAUDE_REMOTE_SLACK_USER_ID", "")
 SLACK_NOTIFY_THRESHOLD = int(os.environ.get("CLAUDE_REMOTE_NOTIFY_THRESHOLD", "30"))  # seconds
 
+# Cross-channel invocation via @ClaudeRemote keyword search
+CROSS_CHANNEL_ENABLED = os.environ.get("CLAUDE_REMOTE_CROSS_CHANNEL", "true").lower() == "true"
+CROSS_CHANNEL_TRIGGER = os.environ.get("CLAUDE_REMOTE_TRIGGER", "@ClaudeRemote")
+
 # Module-level state (set in run_bridge)
 _startup_time: Optional[datetime] = None
 _messages_processed: int = 0
@@ -794,8 +798,15 @@ def send_work_summary(service, my_email: str):
 
     if SUMMARY_LAST_SENT_FILE.exists():
         last_sent = SUMMARY_LAST_SENT_FILE.read_text().strip()
+        # Skip if sent today (date match) or within last 30 minutes (timestamp)
         if last_sent == now.strftime("%Y-%m-%d"):
             return
+        try:
+            last_ts = datetime.fromisoformat(last_sent)
+            if (now - last_ts).total_seconds() < 1800:
+                return
+        except ValueError:
+            pass
 
     if not _skill_exists("summary"):
         log.debug("Skipping work summary: /summary skill not installed")
@@ -1399,6 +1410,86 @@ def mcp_add_reaction(token: str, channel_id: str, message_ts: str, emoji: str = 
         return False
 
 
+def mcp_search_messages(token: str, query: str, limit: int = 20) -> Optional[str]:
+    """Search Slack messages across all channels via MCP."""
+    result = _mcp_call("slack_search_public_and_private", {
+        "query": query,
+        "limit": limit,
+        "include_context": False,
+        "response_format": "detailed",
+    }, token)
+    if result is None:
+        return None
+    return _extract_mcp_text(result)
+
+
+def parse_search_results(search_text: str) -> list:
+    """Parse MCP search result text into structured message dicts.
+
+    The MCP slack_search_public_and_private tool returns formatted text blocks
+    like:
+        === Message 1 ===
+        Channel: #channel-name (C123456)
+        From: User Name (U123456)
+        Time: 2026-03-15 10:30:00
+        Message TS: 1710499800.000100
+        Thread TS: 1710499700.000050
+        Permalink: https://team.slack.com/archives/C123/p1710499800000100
+        Text:
+        @ClaudeRemote do something
+
+    Returns list of dicts with channel_id, ts, thread_ts, user_id, text, permalink.
+    """
+    results = []
+    current = {}
+
+    for line in search_text.splitlines():
+        line = line.strip()
+
+        if line.startswith("=== Message") or line.startswith("=== Result"):
+            if current.get("ts"):
+                results.append(current)
+            current = {}
+            continue
+
+        if line.startswith("Channel:"):
+            # Extract channel ID from "Channel: #name (C123456)"
+            match = re.search(r"\(([A-Z][A-Z0-9]+)\)", line)
+            if match:
+                current["channel_id"] = match.group(1)
+        elif line.startswith("From:"):
+            match = re.search(r"\(([A-Z][A-Z0-9]+)\)", line)
+            if match:
+                current["user_id"] = match.group(1)
+        elif line.startswith("Message TS:"):
+            current["ts"] = line.split(":", 1)[1].strip()
+        elif line.startswith("Thread TS:"):
+            val = line.split(":", 1)[1].strip()
+            if val and val != "None" and val != "N/A":
+                current["thread_ts"] = val
+        elif line.startswith("Permalink:"):
+            current["permalink"] = line.split(":", 1)[1].strip()
+            # Fix: split(":") breaks URLs, rejoin
+            if ":" in line:
+                current["permalink"] = line[len("Permalink:"):].strip()
+        elif line.startswith("Text:"):
+            current["text"] = line[len("Text:"):].strip()
+        elif "text" in current and not any(
+            line.startswith(p) for p in ("Channel:", "From:", "Time:", "Message TS:", "Thread TS:", "Permalink:", "===")
+        ):
+            # Continuation of text field
+            if current["text"]:
+                current["text"] += "\n" + line
+            else:
+                current["text"] = line
+
+    # Don't forget the last message
+    if current.get("ts"):
+        results.append(current)
+
+    return results
+
+
 # ---------------------------------------------------------------------------
 # Slack Message Parsing
 # ---------------------------------------------------------------------------
@@ -1509,17 +1600,24 @@ def should_process(msg: dict) -> bool:
 
 def load_slack_state() -> dict:
     """Load Slack agent state from file."""
+    defaults = {
+        "channel_id": "",
+        "channel_name": SLACK_CHANNEL_NAME,
+        "last_checked_ts": "",
+        "active_threads": {},
+        "search_processed_ids": [],
+        "cross_channel_threads": {},
+    }
     if not SLACK_STATE_FILE.exists():
-        return {
-            "channel_id": "",
-            "channel_name": SLACK_CHANNEL_NAME,
-            "last_checked_ts": "",
-            "active_threads": {},
-        }
+        return defaults
     try:
-        return json.loads(SLACK_STATE_FILE.read_text())
+        state = json.loads(SLACK_STATE_FILE.read_text())
+        # Ensure new fields exist in old state files
+        for key, val in defaults.items():
+            state.setdefault(key, val)
+        return state
     except (json.JSONDecodeError, ValueError):
-        return {"channel_id": "", "channel_name": SLACK_CHANNEL_NAME, "last_checked_ts": "", "active_threads": {}}
+        return defaults
 
 
 def save_slack_state(state: dict):
@@ -1757,6 +1855,225 @@ def slack_poll_cycle(token: str, state: dict):
 
 
 # ---------------------------------------------------------------------------
+# Cross-Channel Slack Cycle
+# ---------------------------------------------------------------------------
+
+
+def slack_cross_channel_cycle(token: str, state: dict):
+    """Search for @ClaudeRemote mentions across all channels and process them."""
+    global _messages_processed
+
+    if not CROSS_CHANNEL_ENABLED or not SLACK_USER_ID:
+        return
+
+    # 1. Search for trigger mentions from today
+    today = datetime.now().strftime("%Y-%m-%d")
+    query = f"{CROSS_CHANNEL_TRIGGER} after:{today}"
+    search_text = mcp_search_messages(token, query)
+    if not search_text:
+        return
+
+    results = parse_search_results(search_text)
+    if not results:
+        return
+
+    # 2. Filter out messages we shouldn't process
+    private_channel_id = state.get("channel_id", "")
+    processed = set(state.get("search_processed_ids", []))
+    cross_threads = state.get("cross_channel_threads", {})
+
+    to_process = []
+    for msg in results:
+        # Security: only process messages from the bridge owner
+        if msg.get("user_id") != SLACK_USER_ID:
+            continue
+        # Skip private channel (handled by existing poll)
+        if msg.get("channel_id") == private_channel_id:
+            continue
+        # Skip already processed
+        if msg.get("ts") in processed:
+            continue
+        # Skip agent replies
+        if AGENT_PREFIX in msg.get("text", ""):
+            continue
+        # Must contain the trigger
+        if CROSS_CHANNEL_TRIGGER not in msg.get("text", ""):
+            continue
+        to_process.append(msg)
+
+    if not to_process:
+        return
+
+    log.info("Cross-channel: found %d new @ClaudeRemote mentions", len(to_process))
+
+    # 3. Process each message
+    for msg in to_process:
+        allowed, remaining = _check_rate_limit()
+        if not allowed:
+            log.warning("Rate limit reached, skipping remaining cross-channel messages")
+            break
+
+        # Strip trigger prefix from text
+        text = msg.get("text", "").replace(CROSS_CHANNEL_TRIGGER, "").strip()
+        if not text:
+            processed.add(msg["ts"])
+            continue
+
+        channel_id = msg["channel_id"]
+        thread_ts = msg.get("thread_ts") or msg["ts"]
+
+        # Acknowledge receipt
+        mcp_add_reaction(token, channel_id, msg["ts"], "eyes")
+
+        # Session management - reuse session if replying in same thread
+        key = f"{channel_id}:{thread_ts}"
+        resume = key in cross_threads
+        if resume:
+            session_id = cross_threads[key]["session_id"]
+        else:
+            session_id = str(uuid.uuid4())
+
+        log.info(
+            "Cross-channel processing (channel=%s, session=%s, resume=%s): %.80s",
+            channel_id, session_id[:8], resume, text,
+        )
+
+        # Build prompt with posting scope restriction
+        no_post_rule = (
+            f"SLACK POSTING RULE: Only post to channel {channel_id}, "
+            f"thread {thread_ts}. Do NOT post to any other channel."
+        )
+        if resume:
+            prompt = f"{no_post_rule}\n\n{text}"
+        else:
+            prompt = (
+                f"{no_post_rule}\n\n"
+                f"You are an AI assistant responding to a Slack message. "
+                f"The message is: {text}\n\n"
+                f"Process this as a task. Use all available MCP tools "
+                f"(Slack, Google Workspace, Glean, etc.) as needed. "
+                f"Use Slack mrkdwn formatting (*bold*, _italic_, `code`). "
+                f"Be concise and helpful."
+            )
+
+        _record_invocation()
+        start_time = time.time()
+        response = invoke_claude(prompt, session_id, resume=resume, thread_id=thread_ts)
+
+        # If resume failed, retry fresh
+        if resume and "[Claude exited with code" in response:
+            log.warning("Cross-channel resume failed for session %s, retrying fresh", session_id[:8])
+            session_id = str(uuid.uuid4())
+            prompt = (
+                f"{no_post_rule}\n\n"
+                f"You are an AI assistant responding to a Slack message. "
+                f"The message is: {text}\n\n"
+                f"Process this as a task. Use all available MCP tools "
+                f"(Slack, Google Workspace, Glean, etc.) as needed. "
+                f"Use Slack mrkdwn formatting (*bold*, _italic_, `code`). "
+                f"Be concise and helpful."
+            )
+            response = invoke_claude(prompt, session_id, resume=False, thread_id=thread_ts)
+        elapsed = time.time() - start_time
+
+        # Post reply - @mention user if task took longer than threshold
+        if SLACK_USER_ID and elapsed >= SLACK_NOTIFY_THRESHOLD:
+            reply_text = f"{AGENT_PREFIX} <@{SLACK_USER_ID}> {response}"
+        else:
+            reply_text = f"{AGENT_PREFIX} {response}"
+
+        success = mcp_send_message(token, channel_id, thread_ts, reply_text)
+        if success:
+            log.info("Cross-channel replied to %s in %s (session=%s)", msg["ts"], channel_id, session_id[:8])
+            mcp_add_reaction(token, channel_id, msg["ts"], "white_check_mark")
+            cross_threads[key] = {
+                "channel_id": channel_id,
+                "thread_ts": thread_ts,
+                "last_reply_ts": msg["ts"],
+                "session_id": session_id,
+            }
+        else:
+            log.error("Cross-channel failed to reply to %s in %s", msg["ts"], channel_id)
+
+        processed.add(msg["ts"])
+        _messages_processed += 1
+
+    # 4. Check cross-channel threads for follow-up replies
+    for key, thread_info in list(cross_threads.items()):
+        channel_id = thread_info["channel_id"]
+        thread_ts = thread_info["thread_ts"]
+        last_reply_ts = thread_info["last_reply_ts"]
+        session_id = thread_info["session_id"]
+
+        thread_text = mcp_read_thread(token, channel_id, thread_ts)
+        if thread_text is None:
+            continue
+
+        replies = parse_thread_replies(thread_text, last_reply_ts)
+        for reply in replies:
+            # Only process replies from the user, skip agent messages
+            if AGENT_PREFIX in reply.get("text", ""):
+                continue
+            if reply.get("user") != SLACK_USER_ID:
+                continue
+
+            allowed, _ = _check_rate_limit()
+            if not allowed:
+                break
+
+            text = reply["text"]
+            mcp_add_reaction(token, channel_id, reply["ts"], "eyes")
+
+            no_post_rule = (
+                f"SLACK POSTING RULE: Only post to channel {channel_id}, "
+                f"thread {thread_ts}. Do NOT post to any other channel."
+            )
+            prompt = f"{no_post_rule}\n\n{text}"
+
+            log.info("Cross-channel thread reply (session=%s): %.80s", session_id[:8], text)
+            _record_invocation()
+            start_time = time.time()
+            response = invoke_claude(prompt, session_id, resume=True, thread_id=thread_ts)
+
+            if "[Claude exited with code" in response:
+                session_id = str(uuid.uuid4())
+                prompt = (
+                    f"{no_post_rule}\n\n"
+                    f"You are an AI assistant replying in a Slack thread. "
+                    f"Here is the full thread context:\n\n{thread_text}\n\n"
+                    f"The latest message is: {text}\n\n"
+                    f"Respond to this latest message. Use Slack mrkdwn formatting "
+                    f"(*bold*, _italic_, `code`). Be concise and helpful. "
+                    f"Use all available MCP tools if needed."
+                )
+                response = invoke_claude(prompt, session_id, resume=False, thread_id=thread_ts)
+            elapsed = time.time() - start_time
+
+            if SLACK_USER_ID and elapsed >= SLACK_NOTIFY_THRESHOLD:
+                reply_text = f"{AGENT_PREFIX} <@{SLACK_USER_ID}> {response}"
+            else:
+                reply_text = f"{AGENT_PREFIX} {response}"
+
+            success = mcp_send_message(token, channel_id, thread_ts, reply_text)
+            if success:
+                mcp_add_reaction(token, channel_id, reply["ts"], "white_check_mark")
+                cross_threads[key]["last_reply_ts"] = reply["ts"]
+                cross_threads[key]["session_id"] = session_id
+            _messages_processed += 1
+
+    # 5. Prune old entries (>7 days) and save state
+    cutoff = time.time() - 7 * 86400
+    cross_threads = {
+        k: v for k, v in cross_threads.items()
+        if float(v.get("last_reply_ts", "0")) > cutoff
+    }
+
+    state["search_processed_ids"] = list(processed)[-500:]  # keep last 500
+    state["cross_channel_threads"] = cross_threads
+    save_slack_state(state)
+
+
+# ---------------------------------------------------------------------------
 # Unified Run Bridge
 # ---------------------------------------------------------------------------
 
@@ -1875,6 +2192,14 @@ def run_bridge(foreground: bool = False, gmail_enabled: bool = True, slack_enabl
                         log.info("Slack poll cycle complete")
                 except Exception:
                     log.exception("Error in Slack poll cycle")
+
+                # Cross-channel @ClaudeRemote search
+                if CROSS_CHANNEL_ENABLED:
+                    try:
+                        slack_state = load_slack_state()
+                        slack_cross_channel_cycle(slack_token, slack_state)
+                    except Exception:
+                        log.exception("Error in cross-channel Slack cycle")
 
         # --- Gmail poll ---
         if gmail_enabled:
