@@ -2051,9 +2051,10 @@ def slack_cross_channel_cycle(token: str, state: dict):
 
         replies = parse_thread_replies(thread_text, last_reply_ts)
         for reply in replies:
-            # Only process replies from the user, skip agent messages
-            if AGENT_PREFIX in reply.get("text", ""):
+            # Skip agent output and MCP-tool-posted messages
+            if not should_process(reply):
                 continue
+            # Only process replies from the bridge owner
             if reply.get("user") != SLACK_USER_ID:
                 continue
 
