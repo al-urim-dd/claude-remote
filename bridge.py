@@ -769,11 +769,13 @@ def _async_invoke_and_reply(
     resume: bool,
     on_success,
     make_retry_prompt=None,
+    notify_user_id: str = "",
 ):
     """Process a Claude invocation in a background thread.
 
     on_success(state, session_id) is called inside _state_lock to atomically
     update state after a successful reply.
+    notify_user_id: Slack user ID to @mention in the reply for slow tasks.
     """
     global _messages_processed
     try:
@@ -790,8 +792,9 @@ def _async_invoke_and_reply(
         elapsed = time.time() - start_time
 
         # Build reply with optional @mention for slow tasks
-        if SLACK_USER_ID and elapsed >= SLACK_NOTIFY_THRESHOLD:
-            reply_text = f"{AGENT_PREFIX} <@{SLACK_USER_ID}> {response}"
+        mention_id = notify_user_id or SLACK_USER_ID
+        if mention_id and elapsed >= SLACK_NOTIFY_THRESHOLD:
+            reply_text = f"{AGENT_PREFIX} <@{mention_id}> {response}"
         else:
             reply_text = f"{AGENT_PREFIX} {response}"
 
@@ -2091,6 +2094,7 @@ def slack_cross_channel_cycle(token: str, state: dict):
             _async_invoke_and_reply,
             token, channel_id, thread_ts, msg["ts"],
             prompt, session_id, False, _on_success, _make_retry,
+            notify_user_id=msg.get("user_id", ""),
         )
 
     # 4. Save processed IDs
