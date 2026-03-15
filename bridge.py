@@ -1941,12 +1941,10 @@ def slack_cross_channel_cycle(token: str, state: dict):
             continue
         to_process.append(msg)
 
-    if not to_process:
-        return
+    if to_process:
+        log.info("Cross-channel: found %d new @ClaudeRemote mentions", len(to_process))
 
-    log.info("Cross-channel: found %d new @ClaudeRemote mentions", len(to_process))
-
-    # 3. Process each message
+    # 3. Process each new mention
     for msg in to_process:
         allowed, remaining = _check_rate_limit()
         if not allowed:
