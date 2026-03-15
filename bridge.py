@@ -2057,6 +2057,9 @@ def slack_cross_channel_cycle(token: str, state: dict):
             # Only process replies from the bridge owner
             if reply.get("user") != SLACK_USER_ID:
                 continue
+            # Skip if already processed as a new @ClaudeRemote mention
+            if reply.get("ts") in processed:
+                continue
 
             allowed, _ = _check_rate_limit()
             if not allowed:
