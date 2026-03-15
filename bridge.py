@@ -1874,11 +1874,17 @@ def slack_poll_cycle(token: str, state: dict):
         log.info("Submitting (session=%s, resume=%s): %.80s", session_id[:8], resume, text)
 
         # Build prompt for Claude
+        no_post = (
+            "SLACK POSTING RULE: Do NOT use slack_send_message or any Slack posting/messaging tool. "
+            "Your text response will be automatically posted to the thread. "
+            "You may use Slack read/search tools for research."
+        )
         if resume:
             prompt = text
         elif msg["is_thread_reply"]:
             thread_context = msg.get("thread_context", "")
             prompt = (
+                f"{no_post}\n\n"
                 f"You are an AI assistant replying in a Slack thread. "
                 f"Here is the full thread context:\n\n{thread_context}\n\n"
                 f"The latest message is: {text}\n\n"
@@ -1888,6 +1894,7 @@ def slack_poll_cycle(token: str, state: dict):
             )
         else:
             prompt = (
+                f"{no_post}\n\n"
                 f"You are an AI assistant responding to a Slack message. "
                 f"The message is: {text}\n\n"
                 f"Process this as a task. Use all available MCP tools "
@@ -1899,9 +1906,10 @@ def slack_poll_cycle(token: str, state: dict):
         # Build retry prompt for resume failures
         _thread_context = msg.get("thread_context", "")
         _msg_text = text
-        def _make_retry(tc=_thread_context, tx=_msg_text):
+        def _make_retry(tc=_thread_context, tx=_msg_text, np=no_post):
             if tc:
                 return (
+                    f"{np}\n\n"
                     f"You are an AI assistant replying in a Slack thread. "
                     f"Here is the full thread context:\n\n{tc}\n\n"
                     f"The latest message is: {tx}\n\n"
@@ -1910,6 +1918,7 @@ def slack_poll_cycle(token: str, state: dict):
                     f"Use all available MCP tools if needed."
                 )
             return (
+                f"{np}\n\n"
                 f"You are an AI assistant responding to a Slack message. "
                 f"The message is: {tx}\n\n"
                 f"Process this as a task. Use all available MCP tools "
@@ -2045,8 +2054,9 @@ def slack_cross_channel_cycle(token: str, state: dict):
 
         # Build prompt with posting scope restriction
         no_post_rule = (
-            f"SLACK POSTING RULE: Only post to channel {channel_id}, "
-            f"thread {thread_ts}. Do NOT post to any other channel."
+            f"SLACK POSTING RULE: Do NOT use slack_send_message or any Slack posting/messaging tool. "
+            f"Your text response will be automatically posted to channel {channel_id}, thread {thread_ts}. "
+            f"You may use Slack read/search tools for research."
         )
         prompt = (
             f"{no_post_rule}\n\n"
