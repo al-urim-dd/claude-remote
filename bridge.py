@@ -136,6 +136,11 @@ _extra_users = os.environ.get("CLAUDE_REMOTE_ALLOWED_USERS", "")
 CROSS_CHANNEL_ALLOWED_USERS: set[str] = {
     uid.strip() for uid in _extra_users.split(",") if uid.strip()
 }
+# Comma-separated channel IDs where ANY user can trigger @ClaudeRemote
+_open_channels = os.environ.get("CLAUDE_REMOTE_OPEN_CHANNELS", "")
+CROSS_CHANNEL_OPEN_CHANNELS: set[str] = {
+    cid.strip() for cid in _open_channels.split(",") if cid.strip()
+}
 
 # Safety guardrails - prepended to every non-resume Claude invocation
 SAFETY_PREAMBLE = """\
@@ -2034,10 +2039,12 @@ def slack_cross_channel_cycle(token: str, state: dict):
 
     to_process = []
     for msg in results:
-        # Security: only process messages from allowed users
-        allowed_users = CROSS_CHANNEL_ALLOWED_USERS | {SLACK_USER_ID}
-        if msg.get("user_id") not in allowed_users:
-            continue
+        # Security: only process messages from allowed users (or any user in open channels)
+        is_open_channel = msg.get("channel_id") in CROSS_CHANNEL_OPEN_CHANNELS
+        if not is_open_channel:
+            allowed_users = CROSS_CHANNEL_ALLOWED_USERS | {SLACK_USER_ID}
+            if msg.get("user_id") not in allowed_users:
+                continue
         # Skip private channel (handled by existing poll)
         if msg.get("channel_id") == private_channel_id:
             continue
