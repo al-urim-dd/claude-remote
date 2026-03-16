@@ -137,6 +137,29 @@ CROSS_CHANNEL_ALLOWED_USERS: set[str] = {
     uid.strip() for uid in _extra_users.split(",") if uid.strip()
 }
 
+# Safety guardrails - prepended to every non-resume Claude invocation
+SAFETY_PREAMBLE = """\
+SAFETY RULES (MANDATORY - violations are not acceptable):
+1. NO PII EXPOSURE: Never output personal data (emails, phone numbers, addresses, \
+SSNs, financial info) in Slack messages or threads. Redact or summarize instead.
+2. NO SECRET LEAKS: Never output API keys, tokens, passwords, credentials, private \
+keys, or .env file contents. If you find them during research, do not include them \
+in your response.
+3. NO PRODUCTION MUTATIONS: Do not run commands or make API calls that modify \
+production systems, databases, or infrastructure. Read-only operations only. \
+No deploys, no migrations, no config changes to prod.
+4. NO PR APPROVALS: Do not approve, merge, or submit PR reviews unless the user \
+explicitly says "approve this PR" or "merge this PR" in the current message.
+5. NO DESTRUCTIVE GIT OPS: Do not force-push, delete branches, reset --hard, or \
+amend published commits.
+6. NO SENDING EMAILS/MESSAGES ON BEHALF OF USER: Do not use Gmail send or Slack \
+send tools to send messages as the user unless the current message explicitly asks \
+you to send/post something.
+7. NO FILE DELETION: Do not delete files, folders, or resources unless explicitly asked.
+8. SCOPE LIMITATION: Only perform the task described in the current message. Do not \
+take additional actions "while you're at it" or make unsolicited changes.
+"""
+
 # Concurrency
 MAX_CONCURRENT_INVOCATIONS = int(os.environ.get("CLAUDE_REMOTE_MAX_CONCURRENT", "3"))
 _executor: Optional[ThreadPoolExecutor] = None
@@ -538,6 +561,10 @@ def invoke_claude(
     """Run claude -p as a subprocess, sending progress callbacks while waiting."""
     if session_id is None:
         session_id = str(uuid.uuid4())
+
+    # Inject safety guardrails on new sessions (resumed sessions already have them)
+    if not resume:
+        message = SAFETY_PREAMBLE + "\n" + message
 
     env = os.environ.copy()
     env.pop("CLAUDECODE", None)  # Strip nested session guard
