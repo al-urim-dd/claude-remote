@@ -885,7 +885,7 @@ class TestParseSearchResults:
 ## Messages (2 results)
 ### Result 1 of 2
 Channel: #general (ID: C0123456789)
-From: Zhengli Sun (ID: U0264PUMBD5)
+From: Zhengli Sun (ID: UTEST12345)
 Time: 2026-03-15 10:30:00 GMT
 Message_ts: 1710499800.000100
 Permalink: [link](https://team.slack.com/archives/C0123456789/p1710499800000100)
@@ -918,7 +918,7 @@ Text:
 
     def test_extracts_user_id(self):
         results = bridge.parse_search_results(self.SAMPLE_SEARCH_OUTPUT)
-        assert results[0]["user_id"] == "U0264PUMBD5"
+        assert results[0]["user_id"] == "UTEST12345"
         assert results[1]["user_id"] == "U999999"
 
     def test_extracts_ts(self):
@@ -995,7 +995,7 @@ Text:
         state = self._make_state()
         with mock.patch.object(bridge, "SLACK_STATE_FILE", tmp_config / "slack_state.json"), \
              mock.patch.object(bridge, "CROSS_CHANNEL_ENABLED", True), \
-             mock.patch.object(bridge, "SLACK_USER_ID", "U0264PUMBD5"), \
+             mock.patch.object(bridge, "SLACK_USER_ID", "UTEST12345"), \
              mock.patch("bridge.mcp_search_messages", return_value=search_output), \
              mock.patch("bridge.invoke_claude") as mock_invoke:
             bridge.slack_cross_channel_cycle("fake-token", state)
@@ -1006,7 +1006,7 @@ Text:
         search_output = """\
 ### Result 1 of 1
 Channel: #private (ID: CPRIVATE)
-From: Me (ID: U0264PUMBD5)
+From: Me (ID: UTEST12345)
 Time: 2026-03-15 10:30:00 GMT
 Message_ts: 1710499800.000100
 Permalink: [link](https://example.com/p1)
@@ -1018,7 +1018,7 @@ Text:
         state = self._make_state(channel_id="CPRIVATE")
         with mock.patch.object(bridge, "SLACK_STATE_FILE", tmp_config / "slack_state.json"), \
              mock.patch.object(bridge, "CROSS_CHANNEL_ENABLED", True), \
-             mock.patch.object(bridge, "SLACK_USER_ID", "U0264PUMBD5"), \
+             mock.patch.object(bridge, "SLACK_USER_ID", "UTEST12345"), \
              mock.patch("bridge.mcp_search_messages", return_value=search_output), \
              mock.patch("bridge.invoke_claude") as mock_invoke:
             bridge.slack_cross_channel_cycle("fake-token", state)
@@ -1029,7 +1029,7 @@ Text:
         search_output = """\
 ### Result 1 of 1
 Channel: #general (ID: CGEN123)
-From: Me (ID: U0264PUMBD5)
+From: Me (ID: UTEST12345)
 Time: 2026-03-15 10:30:00 GMT
 Message_ts: 1710499800.000100
 Permalink: [link](https://example.com/p1)
@@ -1041,7 +1041,7 @@ Text:
         state = self._make_state(processed=["1710499800.000100"])
         with mock.patch.object(bridge, "SLACK_STATE_FILE", tmp_config / "slack_state.json"), \
              mock.patch.object(bridge, "CROSS_CHANNEL_ENABLED", True), \
-             mock.patch.object(bridge, "SLACK_USER_ID", "U0264PUMBD5"), \
+             mock.patch.object(bridge, "SLACK_USER_ID", "UTEST12345"), \
              mock.patch("bridge.mcp_search_messages", return_value=search_output), \
              mock.patch("bridge.invoke_claude") as mock_invoke:
             bridge.slack_cross_channel_cycle("fake-token", state)
@@ -1052,7 +1052,7 @@ Text:
         search_output = """\
 ### Result 1 of 1
 Channel: #general (ID: CGEN123)
-From: Me (ID: U0264PUMBD5)
+From: Me (ID: UTEST12345)
 Time: 2026-03-15 10:30:00 GMT
 Message_ts: 1710499800.000100
 Permalink: [link](https://example.com/p1)
@@ -1065,7 +1065,7 @@ Text:
         mock_executor = mock.MagicMock()
         with mock.patch.object(bridge, "SLACK_STATE_FILE", tmp_config / "slack_state.json"), \
              mock.patch.object(bridge, "CROSS_CHANNEL_ENABLED", True), \
-             mock.patch.object(bridge, "SLACK_USER_ID", "U0264PUMBD5"), \
+             mock.patch.object(bridge, "SLACK_USER_ID", "UTEST12345"), \
              mock.patch.object(bridge, "_executor", mock_executor), \
              mock.patch("bridge.mcp_search_messages", return_value=search_output), \
              mock.patch("bridge.mcp_add_reaction", return_value=True), \

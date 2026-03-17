@@ -124,7 +124,7 @@ AGENT_PREFIX = ":robot_face:"
 BUSINESS_HOURS_START = int(os.environ.get("CLAUDE_REMOTE_BIZ_START", "8"))
 BUSINESS_HOURS_END = int(os.environ.get("CLAUDE_REMOTE_BIZ_END", "22"))
 BUSINESS_HOURS_ONLY = os.environ.get("CLAUDE_REMOTE_BIZ_ONLY", "false").lower() == "true"
-SLACK_CHANNEL_NAME = os.environ.get("CLAUDE_REMOTE_SLACK_CHANNEL", "zhengli-agent")
+SLACK_CHANNEL_NAME = os.environ.get("CLAUDE_REMOTE_SLACK_CHANNEL", "your-agent-channel")
 SLACK_USER_ID = os.environ.get("CLAUDE_REMOTE_SLACK_USER_ID", "")
 SLACK_NOTIFY_THRESHOLD = int(os.environ.get("CLAUDE_REMOTE_NOTIFY_THRESHOLD", "30"))  # seconds
 
@@ -861,9 +861,34 @@ def _skill_exists(skill_name: str) -> bool:
     return (CLAUDE_SKILLS_DIR / skill_name).is_dir()
 
 
+# Built-in prompts for skills that would otherwise require external skill files.
+# These are used as fallback when the skill directory doesn't exist.
+_BUILTIN_SKILL_PROMPTS = {
+    "daily-brief": (
+        "Generate a morning briefing. Include:\n"
+        "1. My calendar events for today (use Google Calendar tools)\n"
+        "2. Unread important emails (use Gmail search)\n"
+        "3. Open PRs that need my review (use GitHub tools if available)\n"
+        "4. Recent Slack messages needing my attention\n"
+        "Format with clear sections. Use markdown. Be concise."
+    ),
+    "daily-summary": (
+        "Generate an end-of-day work summary for today. Include:\n"
+        "1. What I accomplished (check my sent emails, Slack messages, merged PRs)\n"
+        "2. Meetings I attended (check calendar)\n"
+        "3. Open items / carry-forward to tomorrow\n"
+        "Format with clear sections. Use markdown. Be concise."
+    ),
+}
+
+
 def _invoke_skill(skill_name: str) -> str:
-    """Invoke a Claude Code skill (e.g. /brief, /summary) via claude -p."""
-    return invoke_claude(f"/{skill_name}", str(uuid.uuid4()), resume=False)
+    """Invoke a Claude Code skill, falling back to built-in prompt if not installed."""
+    if _skill_exists(skill_name):
+        return invoke_claude(f"/{skill_name}", str(uuid.uuid4()), resume=False)
+    if skill_name in _BUILTIN_SKILL_PROMPTS:
+        return invoke_claude(_BUILTIN_SKILL_PROMPTS[skill_name], str(uuid.uuid4()), resume=False)
+    return f"Unknown skill: {skill_name}"
 
 
 def _send_scheduled_email(service, my_email: str, subject: str, body: str):
@@ -888,11 +913,7 @@ def send_daily_digest(service, my_email: str, thread_sessions: dict, processed_c
         if last_sent == now.strftime("%Y-%m-%d"):
             return
 
-    if not _skill_exists("daily-brief"):
-        log.debug("Skipping morning briefing: /daily-brief skill not installed")
-        return
-
-    log.info("Generating morning briefing via /daily-brief skill")
+    log.info("Generating morning briefing")
     body = _invoke_skill("daily-brief")
 
     if not body or body.startswith("["):
@@ -938,11 +959,7 @@ def send_work_summary(service, my_email: str):
         except ValueError:
             pass
 
-    if not _skill_exists("daily-summary"):
-        log.debug("Skipping work summary: /daily-summary skill not installed")
-        return
-
-    log.info("Generating work summary via /daily-summary skill")
+    log.info("Generating work summary")
     body = _invoke_skill("daily-summary")
 
     if not body or body.startswith("["):
@@ -1077,14 +1094,7 @@ def gmail_poll_cycle(
             save_processed_id(msg_id)
             continue
         if body.lower() == "/daily-summary":
-            if not _skill_exists("daily-summary"):
-                response = "The /daily-summary skill is not installed. Create it at ~/.claude/commands/daily-summary.md"
-                send_reply(service, msg, response, my_email)
-                mark_as_read(service, msg_id)
-                processed_ids.add(msg_id)
-                save_processed_id(msg_id)
-                continue
-            log.info("Manual work summary requested via /daily-summary skill")
+            log.info("Manual work summary requested")
             response = _invoke_skill("daily-summary")
             summary_sent = send_reply(service, msg, response, my_email)
             if summary_sent and "id" in summary_sent:
@@ -1096,14 +1106,7 @@ def gmail_poll_cycle(
             save_processed_id(msg_id)
             continue
         if body.lower() == "/daily-brief":
-            if not _skill_exists("daily-brief"):
-                response = "The /daily-brief skill is not installed. Create it at ~/.claude/commands/daily-brief.md"
-                send_reply(service, msg, response, my_email)
-                mark_as_read(service, msg_id)
-                processed_ids.add(msg_id)
-                save_processed_id(msg_id)
-                continue
-            log.info("Manual morning brief requested via /daily-brief skill")
+            log.info("Manual morning brief requested")
             response = _invoke_skill("daily-brief")
             brief_sent = send_reply(service, msg, response, my_email)
             if brief_sent and "id" in brief_sent:
