@@ -62,7 +62,8 @@ Make sure the Slack MCP plugin is authenticated in Claude Code (run any Slack to
 **Then:**
 
 1. Create a private channel `#your-agent-channel` in Slack
-2. Run `/check-slack` in Claude Code to initialize the channel state
+2. Set `CLAUDE_REMOTE_SLACK_CHANNEL="your-agent-channel"` in `~/.claude-remote/env`
+3. The bridge auto-discovers the channel ID on first startup
 
 ### Environment Configuration
 

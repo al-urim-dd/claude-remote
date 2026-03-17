@@ -1543,6 +1543,40 @@ def mcp_add_reaction(token: str, channel_id: str, message_ts: str, emoji: str = 
         return False
 
 
+def mcp_search_channels(token: str, query: str) -> Optional[str]:
+    """Search for Slack channels by name via MCP. Returns channel ID or None."""
+    result = _mcp_call("slack_search_channels", {
+        "query": query,
+        "limit": 5,
+        "response_format": "detailed",
+    }, token)
+    if result is None:
+        return None
+    raw_text = None
+    if isinstance(result, dict) and "content" in result:
+        for item in result["content"]:
+            if item.get("type") == "text":
+                raw_text = item["text"]
+                break
+    if raw_text is None:
+        return None
+    try:
+        parsed = json.loads(raw_text)
+        if isinstance(parsed, dict) and "results" in parsed:
+            raw_text = parsed["results"]
+    except (json.JSONDecodeError, ValueError):
+        pass
+    # Parse channel ID from "Name: #channel-name\n...ID: C123456" or "(ID: C123456)"
+    for line in raw_text.splitlines():
+        if query.lower() in line.lower():
+            match = re.search(r"\((?:ID:\s*)?([A-Z][A-Z0-9]+)\)", line)
+            if match:
+                return match.group(1)
+    # Fallback: find any channel ID in the text
+    match = re.search(r"\((?:ID:\s*)?([C][A-Z0-9]+)\)", raw_text)
+    return match.group(1) if match else None
+
+
 def mcp_search_messages(token: str, query: str, limit: int = 20) -> Optional[str]:
     """Search Slack messages across all channels via MCP.
 
@@ -2205,10 +2239,17 @@ def run_bridge(foreground: bool = False, gmail_enabled: bool = True, slack_enabl
             log.info("Slack MCP token loaded successfully")
             slack_state = load_slack_state()
             if not slack_state["channel_id"]:
-                raise RuntimeError(
-                    "No channel_id in state file. "
-                    "Run /check-slack in Claude Code first to initialize."
-                )
+                log.info("No channel_id in state - resolving #%s via MCP search", SLACK_CHANNEL_NAME)
+                channel_id = mcp_search_channels(slack_token, SLACK_CHANNEL_NAME)
+                if not channel_id:
+                    raise RuntimeError(
+                        f"Could not find channel #{SLACK_CHANNEL_NAME} in Slack. "
+                        f"Create the channel first, then restart the bridge."
+                    )
+                slack_state["channel_id"] = channel_id
+                slack_state["channel_name"] = SLACK_CHANNEL_NAME
+                save_slack_state(slack_state)
+                log.info("Resolved #%s -> %s", SLACK_CHANNEL_NAME, channel_id)
             if not slack_state["last_checked_ts"]:
                 slack_state["last_checked_ts"] = f"{time.time():.6f}"
                 save_slack_state(slack_state)
