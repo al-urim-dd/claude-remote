@@ -141,7 +141,10 @@ Type `@ClaudeRemote` followed by your task in **any** channel:
 @ClaudeRemote summarize the top learnings in this channel over the past week
 ```
 
-The bridge searches for `@ClaudeRemote` mentions every 15s. Only messages from whitelisted users (or anyone in whitelisted channels) are processed.
+The bridge searches for `@ClaudeRemote` mentions every 15s. Access is controlled at two levels:
+
+- **User allowlist**: specific users can trigger from any channel (`CLAUDE_REMOTE_ALLOWED_USERS`)
+- **Open channels**: in whitelisted channels, *anyone* can trigger (`CLAUDE_REMOTE_OPEN_CHANNELS`)
 
 Reply in the thread to continue the conversation - but you must include `@ClaudeRemote` each time.
 
