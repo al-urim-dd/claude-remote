@@ -103,8 +103,8 @@ Attachments -- Attach files to emails and Claude will analyze them
 Calendar, email, docs -- Claude has access to Google Workspace tools
 Multi-turn -- Reply in the same thread to continue a conversation"""
 
-DIGEST_ENABLED = True
-DIGEST_HOUR = 8  # Send digest at 8am local time
+DIGEST_ENABLED = os.environ.get("CLAUDE_REMOTE_DIGEST_ENABLED", "false").lower() == "true"
+DIGEST_HOUR = int(os.environ.get("CLAUDE_REMOTE_DIGEST_HOUR", "8"))
 DIGEST_LAST_SENT_FILE = CONFIG_DIR / "digest_last_sent.txt"
 
 CANCEL_FILE = CONFIG_DIR / "cancel.txt"
@@ -112,8 +112,8 @@ CANCEL_FILE = CONFIG_DIR / "cancel.txt"
 RATE_LIMIT_PER_HOUR = 20  # Max Claude invocations per hour
 RATE_LIMIT_FILE = CONFIG_DIR / "rate_limit.json"  # Tracks invocation timestamps
 
-SUMMARY_ENABLED = True
-SUMMARY_HOUR = 22  # Send work summary at 10pm local time
+SUMMARY_ENABLED = os.environ.get("CLAUDE_REMOTE_SUMMARY_ENABLED", "false").lower() == "true"
+SUMMARY_HOUR = int(os.environ.get("CLAUDE_REMOTE_SUMMARY_HOUR", "22"))
 SUMMARY_LAST_SENT_FILE = CONFIG_DIR / "summary_last_sent.txt"
 
 # Slack MCP
