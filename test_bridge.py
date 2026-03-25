@@ -1097,5 +1097,45 @@ Text:
             mock_search.assert_not_called()
 
 
+class TestSplitMessage:
+    """Tests for _split_message (chunking long Slack replies)."""
+
+    def test_short_message_unchanged(self):
+        msg = "Hello world"
+        assert bridge._split_message(msg) == [msg]
+
+    def test_exactly_at_limit(self):
+        msg = "x" * 4000
+        assert bridge._split_message(msg) == [msg]
+
+    def test_splits_on_newline(self):
+        line = "a" * 2000
+        msg = f"{line}\n{line}\n{line}"  # 6002 chars total
+        chunks = bridge._split_message(msg)
+        # Each 2000-char line fits individually; split happens at newlines
+        assert len(chunks) == 3
+        assert all(c == line for c in chunks)
+        assert all(len(c) <= 4000 for c in chunks)
+
+    def test_splits_without_newline(self):
+        msg = "x" * 5000
+        chunks = bridge._split_message(msg)
+        assert len(chunks) == 2
+        assert chunks[0] == "x" * 4000
+        assert chunks[1] == "x" * 1000
+
+    def test_preserves_all_content(self):
+        msg = "line\n" * 2000  # 10000 chars
+        chunks = bridge._split_message(msg)
+        reassembled = "\n".join(chunks)
+        assert reassembled.replace("\n", "") == msg.replace("\n", "")
+
+    def test_custom_limit(self):
+        msg = "abc\ndef\nghi"
+        chunks = bridge._split_message(msg, limit=7)
+        # rfind("\n", 0, 7) finds newline at pos 3 -> splits there
+        assert chunks == ["abc", "def\nghi"]
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
