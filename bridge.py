@@ -831,11 +831,6 @@ def _async_invoke_and_reply(
             reply_text = f"{AGENT_PREFIX} {response}"
 
         success = mcp_send_message(token, channel_id, thread_ts, reply_text)
-        if not success and len(reply_text) > 4000:
-            # Retry with truncated message (Slack has ~4000 char limit per block)
-            log.warning("Reply too long (%d chars), retrying truncated", len(reply_text))
-            truncated = reply_text[:3900] + "\n\n_(truncated - response was too long for Slack)_"
-            success = mcp_send_message(token, channel_id, thread_ts, truncated)
         if success:
             log.info("Replied in %s thread %s (session=%s, %.1fs)", channel_id, thread_ts, session_id[:8], elapsed)
             mcp_add_reaction(token, channel_id, msg_ts, "white_check_mark")
@@ -844,7 +839,7 @@ def _async_invoke_and_reply(
                 on_success(state, session_id)
                 save_slack_state(state)
         else:
-            log.error("Failed to reply in %s thread %s", channel_id, thread_ts)
+            log.error("Failed to reply in %s thread %s (reply_len=%d)", channel_id, thread_ts, len(reply_text))
 
         _messages_processed += 1
     except Exception:
@@ -1505,14 +1500,42 @@ def mcp_read_thread(token: str, channel_id: str, message_ts: str) -> Optional[st
     return _extract_mcp_text(result)
 
 
+_SLACK_MAX_MSG_LEN = 4000  # Slack MCP rejects text > ~4000 chars (invalid_blocks)
+
+
+def _split_message(message: str, limit: int = _SLACK_MAX_MSG_LEN) -> list[str]:
+    """Split a long message into chunks no larger than *limit* chars.
+
+    Prefers splitting on newlines to avoid cutting mid-sentence.
+    """
+    if len(message) <= limit:
+        return [message]
+    chunks: list[str] = []
+    while message:
+        if len(message) <= limit:
+            chunks.append(message)
+            break
+        split_at = message.rfind("\n", 0, limit)
+        if split_at <= 0:
+            split_at = limit
+        chunks.append(message[:split_at])
+        message = message[split_at:].lstrip("\n")
+    return chunks
+
+
 def mcp_send_message(token: str, channel_id: str, thread_ts: str, message: str) -> bool:
-    """Send a message via MCP."""
-    result = _mcp_call("slack_send_message", {
-        "channel_id": channel_id,
-        "thread_ts": thread_ts,
-        "message": message,
-    }, token)
-    return result is not None
+    """Send a message via MCP, chunking if it exceeds Slack's size limit."""
+    chunks = _split_message(message)
+    for i, chunk in enumerate(chunks):
+        result = _mcp_call("slack_send_message", {
+            "channel_id": channel_id,
+            "thread_ts": thread_ts,
+            "message": chunk,
+        }, token)
+        if result is None:
+            log.error("mcp_send_message failed on chunk %d/%d (%d chars)", i + 1, len(chunks), len(chunk))
+            return False
+    return True
 
 
 def mcp_add_reaction(token: str, channel_id: str, message_ts: str, emoji: str = "eyes") -> bool:
