@@ -831,6 +831,11 @@ def _async_invoke_and_reply(
             reply_text = f"{AGENT_PREFIX} {response}"
 
         success = mcp_send_message(token, channel_id, thread_ts, reply_text)
+        if not success and len(reply_text) > 4000:
+            # Retry with truncated message (Slack has ~4000 char limit per block)
+            log.warning("Reply too long (%d chars), retrying truncated", len(reply_text))
+            truncated = reply_text[:3900] + "\n\n_(truncated - response was too long for Slack)_"
+            success = mcp_send_message(token, channel_id, thread_ts, truncated)
         if success:
             log.info("Replied in %s thread %s (session=%s, %.1fs)", channel_id, thread_ts, session_id[:8], elapsed)
             mcp_add_reaction(token, channel_id, msg_ts, "white_check_mark")
