@@ -77,7 +77,7 @@ SCOPES = [
 ]
 
 POLL_INTERVAL = int(os.environ.get("CLAUDE_REMOTE_POLL_INTERVAL", "15"))
-CLAUDE_TIMEOUT = 1800  # 30 minutes
+CLAUDE_TIMEOUT = 3600  # 60 minutes
 MAX_RESPONSE_LEN = 50_000  # chars
 CLAUDE_CWD = os.environ.get("CLAUDE_REMOTE_CWD", str(Path.home() / "Projects"))
 SUBJECT_PREFIX = "cc"
@@ -831,6 +831,23 @@ def _async_invoke_and_reply(
             reply_text = f"{AGENT_PREFIX} {response}"
 
         success = mcp_send_message(token, channel_id, thread_ts, reply_text)
+        if not success and len(reply_text) > 4000:
+            # Retry with truncated message (Slack has ~4000 char limit per block)
+            log.warning("Reply too long (%d chars), retrying truncated", len(reply_text))
+            truncated = reply_text[:3900] + "\n\n_(truncated - response was too long for Slack)_"
+            success = mcp_send_message(token, channel_id, thread_ts, truncated)
+        if not success and notify_user_id:
+            # Fallback: DM the requester (handles Slack Connect channels etc.)
+            log.warning("Thread reply failed, falling back to DM for %s", notify_user_id)
+            dm_text = (
+                f"{AGENT_PREFIX} _(Reply to your `{CROSS_CHANNEL_TRIGGER}` request in <#{channel_id}> - "
+                f"couldn't post there directly)_\n\n{response}"
+            )
+            if len(dm_text) > 4000:
+                dm_text = dm_text[:3900] + "\n\n_(truncated)_"
+            success = mcp_send_message(token, notify_user_id, "", dm_text)
+            if success:
+                log.info("Sent DM fallback to %s", notify_user_id)
         if success:
             log.info("Replied in %s thread %s (session=%s, %.1fs)", channel_id, thread_ts, session_id[:8], elapsed)
             mcp_add_reaction(token, channel_id, msg_ts, "white_check_mark")
