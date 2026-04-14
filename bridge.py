@@ -125,7 +125,7 @@ BUSINESS_HOURS_START = int(os.environ.get("CLAUDE_REMOTE_BIZ_START", "8"))
 BUSINESS_HOURS_END = int(os.environ.get("CLAUDE_REMOTE_BIZ_END", "22"))
 BUSINESS_HOURS_ONLY = os.environ.get("CLAUDE_REMOTE_BIZ_ONLY", "false").lower() == "true"
 SLACK_CHANNEL_NAME = os.environ.get("CLAUDE_REMOTE_SLACK_CHANNEL", "your-agent-channel")
-SLACK_USER_ID = os.environ.get("CLAUDE_REMOTE_SLACK_USER_ID", "")
+SLACK_USER_ID = os.environ.get("CLAUDE_REMOTE_SLACK_USER_ID", "")  # auto-resolved at startup if empty
 SLACK_NOTIFY_THRESHOLD = int(os.environ.get("CLAUDE_REMOTE_NOTIFY_THRESHOLD", "30"))  # seconds
 
 # Cross-channel invocation via @ClaudeRemote keyword search
@@ -1661,6 +1661,31 @@ def mcp_add_reaction(token: str, channel_id: str, message_ts: str, emoji: str = 
         return False
 
 
+def mcp_resolve_slack_user_id(token: str) -> Optional[str]:
+    """Get the current Slack user's ID via MCP read_user_profile (no args = self).
+
+    Returns the user ID string (e.g. 'U03QR8V62PN') or None on failure.
+    """
+    result = _mcp_call("slack_read_user_profile", {}, token)
+    if result is None:
+        return None
+    raw_text = None
+    if isinstance(result, dict) and "content" in result:
+        for item in result["content"]:
+            if item.get("type") == "text":
+                raw_text = item["text"]
+                break
+    if not raw_text:
+        return None
+    # The profile text contains "User ID: U03QR8V62PN" or similar
+    match = re.search(r"User ID:\s*(U[A-Z0-9]+)", raw_text)
+    if match:
+        return match.group(1)
+    # Fallback: any U-prefixed ID
+    match = re.search(r"\b(U[A-Z0-9]{8,})\b", raw_text)
+    return match.group(1) if match else None
+
+
 def mcp_search_channels(token: str, query: str) -> Optional[str]:
     """Search for Slack channels by name via MCP. Returns channel ID or None."""
     result = _mcp_call("slack_search_channels", {
@@ -2368,6 +2393,20 @@ def run_bridge(foreground: bool = False, gmail_enabled: bool = True, slack_enabl
                 slack_state["channel_name"] = SLACK_CHANNEL_NAME
                 save_slack_state(slack_state)
                 log.info("Resolved #%s -> %s", SLACK_CHANNEL_NAME, channel_id)
+            # Auto-resolve SLACK_USER_ID if not set via env
+            global SLACK_USER_ID
+            if not SLACK_USER_ID:
+                log.info("SLACK_USER_ID not set, resolving via MCP...")
+                resolved_uid = mcp_resolve_slack_user_id(slack_token)
+                if resolved_uid:
+                    SLACK_USER_ID = resolved_uid
+                    log.info("Auto-resolved SLACK_USER_ID -> %s", SLACK_USER_ID)
+                else:
+                    log.warning(
+                        "Could not auto-resolve SLACK_USER_ID. "
+                        "Cross-channel @ClaudeRemote mentions will be disabled. "
+                        "Set CLAUDE_REMOTE_SLACK_USER_ID env var to fix."
+                    )
             if not slack_state["last_checked_ts"]:
                 slack_state["last_checked_ts"] = f"{time.time():.6f}"
                 save_slack_state(slack_state)
