@@ -574,7 +574,7 @@ def invoke_claude(
     env = os.environ.copy()
     env.pop("CLAUDECODE", None)  # Strip nested session guard
 
-    cmd = ["claude", "-p", "--output-format", "text"]
+    cmd = ["claude", "-p", "--output-format", "text", "--dangerously-skip-permissions"]
     if resume:
         cmd.extend(["--resume", session_id])
     else:
