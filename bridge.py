@@ -1628,7 +1628,8 @@ def mcp_send_message(token: str, channel_id: str, thread_ts: str, message: str) 
     """Send a message via MCP, chunking if it exceeds Slack's size limit.
 
     On invalid_blocks errors, retries with sanitized content.
-    On externally_shared_channel_restricted, falls back to direct Slack API.
+    On any MCP failure, falls back to direct Slack API (handles Slack Connect
+    channels and other MCP restrictions).
     """
     chunks = _split_message(message)
     for i, chunk in enumerate(chunks):
@@ -1636,37 +1637,37 @@ def mcp_send_message(token: str, channel_id: str, thread_ts: str, message: str) 
         if thread_ts:
             args["thread_ts"] = thread_ts
         result = _mcp_call("slack_send_message", args, token)
-        if not result:
-            # Slack Connect channels: MCP blocks writes, use direct API
-            if isinstance(result, McpError) and result.is_externally_shared_restricted:
-                log.warning("Slack Connect channel detected, falling back to direct API for chunk %d/%d",
-                            i + 1, len(chunks))
-                if slack_post_message_direct(token, channel_id, thread_ts, chunk):
-                    continue
-                log.error("Direct API fallback also failed for chunk %d/%d", i + 1, len(chunks))
-                return False
-            # On invalid_blocks, retry with sanitized content
-            if isinstance(result, McpError) and result.is_invalid_blocks:
-                sanitized = _sanitize_for_slack(chunk)
-                log.warning("invalid_blocks on chunk %d/%d (%d chars), retrying sanitized (%d chars)",
-                            i + 1, len(chunks), len(chunk), len(sanitized))
-                retry_args = {"channel_id": channel_id, "message": sanitized}
-                if thread_ts:
-                    retry_args["thread_ts"] = thread_ts
-                result = _mcp_call("slack_send_message", retry_args, token)
-                if result:
-                    continue
-                # Last resort: strip all markdown formatting
-                plaintext = re.sub(r"[*_~`#>\[\]]", "", sanitized)
-                log.warning("Sanitized still failed, retrying as plaintext (%d chars)", len(plaintext))
-                plain_args = {"channel_id": channel_id, "message": plaintext}
-                if thread_ts:
-                    plain_args["thread_ts"] = thread_ts
-                result = _mcp_call("slack_send_message", plain_args, token)
-                if result:
-                    continue
-            log.error("mcp_send_message failed on chunk %d/%d (%d chars)", i + 1, len(chunks), len(chunk))
-            return False
+        if result:
+            continue
+
+        # On invalid_blocks, retry with sanitized content via MCP
+        if isinstance(result, McpError) and result.is_invalid_blocks:
+            sanitized = _sanitize_for_slack(chunk)
+            log.warning("invalid_blocks on chunk %d/%d (%d chars), retrying sanitized (%d chars)",
+                        i + 1, len(chunks), len(chunk), len(sanitized))
+            retry_args = {"channel_id": channel_id, "message": sanitized}
+            if thread_ts:
+                retry_args["thread_ts"] = thread_ts
+            result = _mcp_call("slack_send_message", retry_args, token)
+            if result:
+                continue
+            # Try plaintext via MCP
+            plaintext = re.sub(r"[*_~`#>\[\]]", "", sanitized)
+            log.warning("Sanitized still failed, retrying as plaintext (%d chars)", len(plaintext))
+            plain_args = {"channel_id": channel_id, "message": plaintext}
+            if thread_ts:
+                plain_args["thread_ts"] = thread_ts
+            result = _mcp_call("slack_send_message", plain_args, token)
+            if result:
+                continue
+
+        # All MCP attempts failed. Fall back to direct Slack API
+        # (bypasses MCP restrictions like Slack Connect channel blocks).
+        log.warning("MCP send failed, falling back to direct Slack API for chunk %d/%d", i + 1, len(chunks))
+        if slack_post_message_direct(token, channel_id, thread_ts, chunk):
+            continue
+        log.error("All send methods failed for chunk %d/%d (%d chars)", i + 1, len(chunks), len(chunk))
+        return False
     return True
 
 
