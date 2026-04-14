@@ -834,7 +834,7 @@ def _async_invoke_and_reply(
         if not success and len(reply_text) > 4000:
             # Retry with truncated message (Slack has ~4000 char limit per block)
             log.warning("Reply too long (%d chars), retrying truncated", len(reply_text))
-            truncated = reply_text[:3900] + "\n\n_(truncated - response was too long for Slack)_"
+            truncated = reply_text[:3900] + "\n\n_(truncated, response was too long for Slack)_"
             success = mcp_send_message(token, channel_id, thread_ts, truncated)
         if not success and notify_user_id:
             # Fallback: DM the requester (handles Slack Connect channels etc.)
@@ -1429,8 +1429,29 @@ def get_slack_token() -> Optional[str]:
 # ---------------------------------------------------------------------------
 
 
-def _mcp_call(tool_name: str, arguments: dict, token: str) -> Optional[dict]:
-    """Call a Slack MCP tool via HTTP JSON-RPC."""
+class McpError:
+    """Sentinel returned by _mcp_call on failure so callers can inspect the error."""
+    def __init__(self, message: str = "", code: int = 0):
+        self.message = message
+        self.code = code
+
+    def __bool__(self):
+        return False  # falsy, so ``if result is None`` and ``if not result`` both work
+
+    @property
+    def is_invalid_blocks(self) -> bool:
+        return "invalid_blocks" in self.message
+
+
+_MCP_ERROR_GENERIC = McpError("unknown")
+
+
+def _mcp_call(tool_name: str, arguments: dict, token: str) -> Optional[dict | McpError]:
+    """Call a Slack MCP tool via HTTP JSON-RPC.
+
+    Returns the result dict on success, or an McpError on failure (falsy, so
+    existing ``if result is None`` checks still work).
+    """
     payload = json.dumps({
         "jsonrpc": "2.0",
         "id": 1,
@@ -1455,15 +1476,19 @@ def _mcp_call(tool_name: str, arguments: dict, token: str) -> Optional[dict]:
         with urlopen(req, timeout=30) as resp:
             body = json.loads(resp.read())
             if "error" in body:
-                log.error("MCP error: %s", body["error"])
-                return None
+                err = body["error"]
+                msg = err.get("message", str(err)) if isinstance(err, dict) else str(err)
+                code = err.get("code", 0) if isinstance(err, dict) else 0
+                log.error("MCP error: %s", err)
+                return McpError(msg, code)
             return body.get("result", body)
     except HTTPError as e:
-        log.error("MCP HTTP error %d: %s", e.code, e.read().decode()[:500])
-        return None
+        msg = e.read().decode()[:500]
+        log.error("MCP HTTP error %d: %s", e.code, msg)
+        return McpError(msg, e.code)
     except (URLError, TimeoutError) as e:
         log.error("MCP connection error: %s", e)
-        return None
+        return McpError(str(e))
 
 
 def _extract_mcp_text(result: dict) -> Optional[str]:
@@ -1501,7 +1526,7 @@ def mcp_read_channel(token: str, channel_id: str, oldest: str = "", limit: int =
     if oldest:
         args["oldest"] = oldest
     result = _mcp_call("slack_read_channel", args, token)
-    if result is None:
+    if not result:
         return None
     return _extract_mcp_text(result)
 
@@ -1512,7 +1537,7 @@ def mcp_read_thread(token: str, channel_id: str, message_ts: str) -> Optional[st
         "channel_id": channel_id,
         "message_ts": message_ts,
     }, token)
-    if result is None:
+    if not result:
         return None
     return _extract_mcp_text(result)
 
@@ -1540,8 +1565,34 @@ def _split_message(message: str, limit: int = _SLACK_MAX_MSG_LEN) -> list[str]:
     return chunks
 
 
+def _sanitize_for_slack(text: str) -> str:
+    """Strip markdown constructs that cause Slack invalid_blocks errors.
+
+    Slack's message formatter chokes on certain markdown patterns (tables,
+    HTML tags, deeply nested lists, some link/image syntaxes). This function
+    strips them down to plain text equivalents.
+    """
+    # Remove HTML tags (Slack blocks don't support raw HTML)
+    text = re.sub(r"<(?![@#!])(/?[a-zA-Z][^>]*)>", "", text)
+    # Convert markdown tables to plain text (header + separator + rows)
+    text = re.sub(r"^\|(.+)\|$", lambda m: m.group(1).replace("|", " | ").strip(), text, flags=re.MULTILINE)
+    text = re.sub(r"^[\|\s\-:]+$", "", text, flags=re.MULTILINE)
+    # Remove image references ![alt](url)
+    text = re.sub(r"!\[([^\]]*)\]\([^)]+\)", r"\1", text)
+    # Simplify reference-style links [text][ref] to just text
+    text = re.sub(r"\[([^\]]+)\]\[[^\]]*\]", r"\1", text)
+    # Remove horizontal rules that may confuse block parsing
+    text = re.sub(r"^[\s]*[-*_]{3,}[\s]*$", "", text, flags=re.MULTILINE)
+    # Collapse excessive blank lines
+    text = re.sub(r"\n{4,}", "\n\n\n", text)
+    return text.strip()
+
+
 def mcp_send_message(token: str, channel_id: str, thread_ts: str, message: str) -> bool:
-    """Send a message via MCP, chunking if it exceeds Slack's size limit."""
+    """Send a message via MCP, chunking if it exceeds Slack's size limit.
+
+    On invalid_blocks errors, retries with sanitized content.
+    """
     chunks = _split_message(message)
     for i, chunk in enumerate(chunks):
         result = _mcp_call("slack_send_message", {
@@ -1549,7 +1600,29 @@ def mcp_send_message(token: str, channel_id: str, thread_ts: str, message: str) 
             "thread_ts": thread_ts,
             "message": chunk,
         }, token)
-        if result is None:
+        if not result:
+            # On invalid_blocks, retry with sanitized content
+            if isinstance(result, McpError) and result.is_invalid_blocks:
+                sanitized = _sanitize_for_slack(chunk)
+                log.warning("invalid_blocks on chunk %d/%d (%d chars), retrying sanitized (%d chars)",
+                            i + 1, len(chunks), len(chunk), len(sanitized))
+                result = _mcp_call("slack_send_message", {
+                    "channel_id": channel_id,
+                    "thread_ts": thread_ts,
+                    "message": sanitized,
+                }, token)
+                if result:
+                    continue
+                # Last resort: strip all markdown formatting
+                plaintext = re.sub(r"[*_~`#>\[\]]", "", sanitized)
+                log.warning("Sanitized still failed, retrying as plaintext (%d chars)", len(plaintext))
+                result = _mcp_call("slack_send_message", {
+                    "channel_id": channel_id,
+                    "thread_ts": thread_ts,
+                    "message": plaintext,
+                }, token)
+                if result:
+                    continue
             log.error("mcp_send_message failed on chunk %d/%d (%d chars)", i + 1, len(chunks), len(chunk))
             return False
     return True
