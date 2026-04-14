@@ -1595,32 +1595,29 @@ def mcp_send_message(token: str, channel_id: str, thread_ts: str, message: str) 
     """
     chunks = _split_message(message)
     for i, chunk in enumerate(chunks):
-        result = _mcp_call("slack_send_message", {
-            "channel_id": channel_id,
-            "thread_ts": thread_ts,
-            "message": chunk,
-        }, token)
+        args = {"channel_id": channel_id, "message": chunk}
+        if thread_ts:
+            args["thread_ts"] = thread_ts
+        result = _mcp_call("slack_send_message", args, token)
         if not result:
             # On invalid_blocks, retry with sanitized content
             if isinstance(result, McpError) and result.is_invalid_blocks:
                 sanitized = _sanitize_for_slack(chunk)
                 log.warning("invalid_blocks on chunk %d/%d (%d chars), retrying sanitized (%d chars)",
                             i + 1, len(chunks), len(chunk), len(sanitized))
-                result = _mcp_call("slack_send_message", {
-                    "channel_id": channel_id,
-                    "thread_ts": thread_ts,
-                    "message": sanitized,
-                }, token)
+                retry_args = {"channel_id": channel_id, "message": sanitized}
+                if thread_ts:
+                    retry_args["thread_ts"] = thread_ts
+                result = _mcp_call("slack_send_message", retry_args, token)
                 if result:
                     continue
                 # Last resort: strip all markdown formatting
                 plaintext = re.sub(r"[*_~`#>\[\]]", "", sanitized)
                 log.warning("Sanitized still failed, retrying as plaintext (%d chars)", len(plaintext))
-                result = _mcp_call("slack_send_message", {
-                    "channel_id": channel_id,
-                    "thread_ts": thread_ts,
-                    "message": plaintext,
-                }, token)
+                plain_args = {"channel_id": channel_id, "message": plaintext}
+                if thread_ts:
+                    plain_args["thread_ts"] = thread_ts
+                result = _mcp_call("slack_send_message", plain_args, token)
                 if result:
                     continue
             log.error("mcp_send_message failed on chunk %d/%d (%d chars)", i + 1, len(chunks), len(chunk))
