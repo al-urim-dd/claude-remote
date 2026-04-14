@@ -1442,6 +1442,10 @@ class McpError:
     def is_invalid_blocks(self) -> bool:
         return "invalid_blocks" in self.message
 
+    @property
+    def is_externally_shared_restricted(self) -> bool:
+        return "externally_shared_channel_restricted" in self.message
+
 
 _MCP_ERROR_GENERIC = McpError("unknown")
 
@@ -1588,10 +1592,43 @@ def _sanitize_for_slack(text: str) -> str:
     return text.strip()
 
 
+def slack_post_message_direct(token: str, channel_id: str, thread_ts: str, message: str) -> bool:
+    """Post a message via Slack chat.postMessage REST API directly.
+
+    Bypasses the MCP server, which blocks writes to Slack Connect
+    (externally shared) channels. The OAuth token works fine with
+    the REST API regardless of channel type.
+    """
+    payload = {"channel": channel_id, "text": message}
+    if thread_ts:
+        payload["thread_ts"] = thread_ts
+    data = json.dumps(payload).encode()
+    req = URLRequest(
+        "https://slack.com/api/chat.postMessage",
+        data=data,
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {token}",
+        },
+        method="POST",
+    )
+    try:
+        with urlopen(req, timeout=15) as resp:
+            body = json.loads(resp.read())
+            if body.get("ok"):
+                return True
+            log.error("slack_post_message_direct error: %s", body.get("error"))
+            return False
+    except (URLError, TimeoutError) as e:
+        log.error("slack_post_message_direct network error: %s", e)
+        return False
+
+
 def mcp_send_message(token: str, channel_id: str, thread_ts: str, message: str) -> bool:
     """Send a message via MCP, chunking if it exceeds Slack's size limit.
 
     On invalid_blocks errors, retries with sanitized content.
+    On externally_shared_channel_restricted, falls back to direct Slack API.
     """
     chunks = _split_message(message)
     for i, chunk in enumerate(chunks):
@@ -1600,6 +1637,14 @@ def mcp_send_message(token: str, channel_id: str, thread_ts: str, message: str) 
             args["thread_ts"] = thread_ts
         result = _mcp_call("slack_send_message", args, token)
         if not result:
+            # Slack Connect channels: MCP blocks writes, use direct API
+            if isinstance(result, McpError) and result.is_externally_shared_restricted:
+                log.warning("Slack Connect channel detected, falling back to direct API for chunk %d/%d",
+                            i + 1, len(chunks))
+                if slack_post_message_direct(token, channel_id, thread_ts, chunk):
+                    continue
+                log.error("Direct API fallback also failed for chunk %d/%d", i + 1, len(chunks))
+                return False
             # On invalid_blocks, retry with sanitized content
             if isinstance(result, McpError) and result.is_invalid_blocks:
                 sanitized = _sanitize_for_slack(chunk)
