@@ -30,6 +30,21 @@ else
     "$VENV_DIR/bin/pip" install -r "$SCRIPT_DIR/requirements.txt"
 fi
 
+# 2b. Install ffmpeg (required for audio transcription via whisper)
+if ! command -v ffmpeg &>/dev/null; then
+    echo "Installing ffmpeg (required for audio transcription)..."
+    if command -v brew &>/dev/null; then
+        brew install ffmpeg
+    elif command -v apt-get &>/dev/null; then
+        sudo apt-get install -y ffmpeg
+    else
+        echo "WARNING: ffmpeg not found and no package manager detected."
+        echo "  Install ffmpeg manually for audio transcription support."
+    fi
+else
+    echo "ffmpeg already installed."
+fi
+
 # 3. Check for client_secret.json
 if [ ! -f "$CONFIG_DIR/client_secret.json" ]; then
     echo ""

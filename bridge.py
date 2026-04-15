@@ -83,8 +83,10 @@ CLAUDE_CWD = os.environ.get("CLAUDE_REMOTE_CWD", str(Path.home() / "Projects"))
 SUBJECT_PREFIX = "cc"
 REPLY_SENDER_NAME = "ClaudeRemote"  # Display name on reply emails
 ATTACHMENTS_DIR = CONFIG_DIR / "attachments"
+AUDIO_CACHE_DIR = CONFIG_DIR / "audio_cache"
 MAX_ATTACHMENT_SIZE = 10 * 1024 * 1024  # 10 MB
 ATTACHMENT_MAX_AGE_HOURS = 24
+WHISPER_MODEL = os.environ.get("CLAUDE_REMOTE_WHISPER_MODEL", "base")
 PROGRESS_INTERVAL = 120  # seconds between "still working" emails
 CLAUDE_SESSIONS_DIR = Path.home() / ".claude" / "projects"
 
@@ -412,12 +414,265 @@ def download_attachments(service, msg_id: str, attachment_metas: list) -> list:
 
 def cleanup_old_attachments():
     """Remove attachment directories older than ATTACHMENT_MAX_AGE_HOURS."""
-    if not ATTACHMENTS_DIR.exists():
-        return
-    cutoff = time.time() - ATTACHMENT_MAX_AGE_HOURS * 3600
-    for child in ATTACHMENTS_DIR.iterdir():
-        if child.is_dir() and child.stat().st_mtime < cutoff:
-            shutil.rmtree(child, ignore_errors=True)
+    for cache_dir in (ATTACHMENTS_DIR, AUDIO_CACHE_DIR):
+        if not cache_dir.exists():
+            continue
+        cutoff = time.time() - ATTACHMENT_MAX_AGE_HOURS * 3600
+        for child in cache_dir.iterdir():
+            if child.is_dir() and child.stat().st_mtime < cutoff:
+                shutil.rmtree(child, ignore_errors=True)
+
+
+# ---------------------------------------------------------------------------
+# Slack Audio Transcription
+# ---------------------------------------------------------------------------
+
+# Regex to match Slack file references in MCP-formatted messages
+_AUDIO_FILE_RE = re.compile(
+    r"Files?:\s*(.+?)\s*\(ID:\s*(\w+),\s*(audio/\S+),\s*([\d.]+\s*\w+)\)",
+)
+
+_whisper_model_cache = None
+
+
+def _get_whisper_model():
+    """Lazy-load the whisper model (downloads on first use)."""
+    global _whisper_model_cache
+    if _whisper_model_cache is not None:
+        return _whisper_model_cache
+    try:
+        import whisper  # type: ignore
+        log.info("Loading whisper model '%s'...", WHISPER_MODEL)
+        _whisper_model_cache = whisper.load_model(WHISPER_MODEL)
+        log.info("Whisper model loaded")
+        return _whisper_model_cache
+    except ImportError:
+        log.warning("openai-whisper not installed, audio transcription disabled")
+        return None
+    except Exception as exc:
+        log.warning("Failed to load whisper model: %s", exc)
+        return None
+
+
+def _get_slack_file_token() -> tuple:
+    """Get a valid xoxc token and d cookie for downloading Slack files.
+
+    Reads from the Slack desktop app's local storage (LevelDB) and cookie
+    database. Returns (xoxc_token, d_cookie) or (None, None) on failure.
+    """
+    leveldb_path = Path.home() / "Library" / "Application Support" / "Slack" / "Local Storage" / "leveldb"
+    cookies_path = Path.home() / "Library" / "Application Support" / "Slack" / "Cookies"
+
+    if not leveldb_path.exists() or not cookies_path.exists():
+        return None, None
+
+    # Find xoxc token for the DoorDash enterprise workspace from localStorage
+    xoxc_token = None
+    try:
+        import sqlite3
+        import hashlib
+
+        # Read all xoxc tokens from LevelDB files and pick the enterprise one
+        # by looking for context clues (the enterprise domain entry nearby)
+        best_token = None
+        for fname in sorted(leveldb_path.iterdir(), key=lambda p: p.stat().st_mtime, reverse=True):
+            if not fname.suffix in ('.ldb', '.log'):
+                continue
+            try:
+                data = fname.read_bytes()
+                # Look for enterprise Slack token (associated with enterprise workspace)
+                # Try localConfig_v2 pattern first
+                for prefix in (b'"doordash.enterprise', b'"doordash"', b'"domain":"doordash"'):
+                    if prefix in data:
+                        idx = 0
+                        while True:
+                            idx = data.find(b'xoxc-', idx)
+                            if idx < 0:
+                                break
+                            end = idx
+                            while end < len(data) and end - idx < 300:
+                                if data[end:end+1] in (b'"', b"'", b'\n', b'\x00', b'\x01'):
+                                    break
+                                end += 1
+                            candidate = data[idx:end].decode(errors='ignore')
+                            if len(candidate) > 50:
+                                best_token = candidate
+                            idx = end
+                        if best_token:
+                            break
+                if best_token:
+                    break
+            except Exception:
+                continue
+        xoxc_token = best_token
+
+        # Decrypt the d cookie from the Cookies database
+        key_bytes = subprocess.check_output(
+            ['security', 'find-generic-password', '-s', 'Slack Safe Storage', '-w'],
+            stderr=subprocess.DEVNULL,
+        ).strip()
+        derived_key = hashlib.pbkdf2_hmac('sha1', key_bytes, b'saltysalt', 1003, dklen=16)
+
+        from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+        from cryptography.hazmat.backends import default_backend
+
+        conn = sqlite3.connect(str(cookies_path))
+        cursor = conn.cursor()
+        cursor.execute("SELECT encrypted_value FROM cookies WHERE host_key LIKE '%slack.com%' AND name = 'd'")
+        row = cursor.fetchone()
+        conn.close()
+
+        d_cookie = None
+        if row:
+            enc_val = row[0]
+            if enc_val[:3] == b'v10':
+                iv = b' ' * 16
+                cipher = Cipher(algorithms.AES(derived_key), modes.CBC(iv), backend=default_backend())
+                decryptor = cipher.decryptor()
+                decrypted = decryptor.update(enc_val[3:]) + decryptor.finalize()
+                pad_len = decrypted[-1] if isinstance(decrypted[-1], int) else ord(decrypted[-1])
+                dec_str = decrypted[:-pad_len].decode('utf-8', errors='replace')
+                xoxd_idx = dec_str.find('xoxd-')
+                if xoxd_idx >= 0:
+                    d_cookie = dec_str[xoxd_idx:]
+
+        return xoxc_token, d_cookie
+
+    except Exception as exc:
+        log.debug("Failed to extract Slack file token: %s", exc)
+        return None, None
+
+
+def _get_slack_file_token_from_browser() -> tuple:
+    """Fallback: get the token from the Slack web app's localStorage via Playwright.
+
+    This is used when the desktop app tokens are stale. Requires an active
+    browser session with Slack cookies.
+    """
+    # For now, return None. The desktop token path covers the common case.
+    return None, None
+
+
+_slack_file_token_cache = None
+
+
+def _cached_slack_file_token() -> tuple:
+    """Return cached (xoxc, d_cookie) pair, refreshing once per session."""
+    global _slack_file_token_cache
+    if _slack_file_token_cache is None:
+        _slack_file_token_cache = _get_slack_file_token()
+    return _slack_file_token_cache
+
+
+def download_slack_audio(file_id: str, filename: str) -> Optional[Path]:
+    """Download a Slack audio file by file ID. Returns local path or None."""
+    AUDIO_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
+    dest = AUDIO_CACHE_DIR / f"{file_id}_{filename}"
+    if dest.exists() and dest.stat().st_size > 0:
+        return dest
+
+    xoxc, d_cookie = _cached_slack_file_token()
+    if not xoxc or not d_cookie:
+        log.warning("No Slack file credentials available, cannot download audio")
+        return None
+
+    # Step 1: get the private download URL via files.info
+    try:
+        form_data = urlencode({"file": file_id}).encode()
+        req = URLRequest(
+            "https://doordashext.slack.com/api/files.info",
+            data=form_data,
+            headers={
+                "Authorization": f"Bearer {xoxc}",
+                "Cookie": f"d={d_cookie}",
+                "Content-Type": "application/x-www-form-urlencoded",
+            },
+        )
+        with urlopen(req, timeout=30) as resp:
+            info = json.loads(resp.read())
+
+        if not info.get("ok"):
+            log.warning("files.info failed for %s: %s", file_id, info.get("error"))
+            return None
+
+        download_url = info["file"].get("url_private_download")
+        if not download_url:
+            log.warning("No download URL for file %s", file_id)
+            return None
+    except Exception as exc:
+        log.warning("Failed to get file info for %s: %s", file_id, exc)
+        return None
+
+    # Step 2: download the file
+    try:
+        req = URLRequest(
+            download_url,
+            headers={
+                "Authorization": f"Bearer {xoxc}",
+                "Cookie": f"d={d_cookie}",
+            },
+        )
+        with urlopen(req, timeout=60) as resp:
+            dest.write_bytes(resp.read())
+        log.info("Downloaded audio %s (%d bytes)", file_id, dest.stat().st_size)
+        return dest
+    except Exception as exc:
+        log.warning("Failed to download audio %s: %s", file_id, exc)
+        if dest.exists():
+            dest.unlink()
+        return None
+
+
+def transcribe_audio(audio_path: Path) -> Optional[str]:
+    """Transcribe an audio file using whisper. Returns text or None."""
+    model = _get_whisper_model()
+    if model is None:
+        return None
+
+    try:
+        result = model.transcribe(str(audio_path), language="en")
+        text = result.get("text", "").strip()
+        if text:
+            log.info("Transcribed %s: %.80s", audio_path.name, text)
+        return text or None
+    except Exception as exc:
+        log.warning("Transcription failed for %s: %s", audio_path.name, exc)
+        return None
+
+
+def process_slack_audio_files(message_text: str) -> str:
+    """Detect audio file references in a Slack message, download and transcribe them.
+
+    Returns a preamble string with transcriptions to prepend to the prompt,
+    or an empty string if no audio files were found or transcription failed.
+    """
+    matches = _AUDIO_FILE_RE.findall(message_text)
+    if not matches:
+        return ""
+
+    transcriptions = []
+    for filename, file_id, mime_type, size_str in matches:
+        if not mime_type.startswith("audio/"):
+            continue
+        log.info("Processing audio file: %s (ID: %s)", filename.strip(), file_id)
+
+        audio_path = download_slack_audio(file_id, filename.strip().replace(" ", "_"))
+        if audio_path is None:
+            transcriptions.append(f"[Audio: {filename.strip()} could not be downloaded]")
+            continue
+
+        text = transcribe_audio(audio_path)
+        if text is None:
+            transcriptions.append(f"[Audio: {filename.strip()} could not be transcribed]")
+            continue
+
+        transcriptions.append(f'Audio transcription of "{filename.strip()}":\n{text}')
+
+    if not transcriptions:
+        return ""
+
+    return "\n\n".join(transcriptions) + "\n\n"
 
 
 def get_thread_history(service, thread_id: str) -> list:
@@ -2121,6 +2376,11 @@ def slack_poll_cycle(token: str, state: dict):
 
         # Acknowledge receipt with eyes emoji
         mcp_add_reaction(token, channel_id, msg["ts"], "eyes")
+
+        # Transcribe any audio files attached to the message
+        audio_preamble = process_slack_audio_files(text)
+        if audio_preamble:
+            text = audio_preamble + text
 
         # Determine session: resume existing or start new
         thread_sessions = state.get("thread_sessions", {})
