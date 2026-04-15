@@ -2339,11 +2339,13 @@ def slack_poll_cycle(token: str, state: dict):
         for msg in new_top_level:
             if float(msg.get("ts", "0")) > float(newest_ts):
                 newest_ts = msg["ts"]
-        if newest_ts != last_ts:
-            state["last_checked_ts"] = newest_ts
-        # Always save if thread_failures changed or timestamp updated
-        state["thread_failures"] = thread_failures
-        save_slack_state(state)
+        # Re-read state under lock to avoid clobbering async thread updates
+        with _state_lock:
+            state = load_slack_state()
+            if newest_ts != last_ts:
+                state["last_checked_ts"] = newest_ts
+            state["thread_failures"] = thread_failures
+            save_slack_state(state)
         return
 
     log.info(
