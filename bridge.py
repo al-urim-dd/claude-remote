@@ -77,8 +77,10 @@ SCOPES = [
 ]
 
 POLL_INTERVAL = int(os.environ.get("CLAUDE_REMOTE_POLL_INTERVAL", "15"))
-CLAUDE_TIMEOUT = 3600  # 60 minutes
+CLAUDE_TIMEOUT = int(os.environ.get("CLAUDE_REMOTE_TIMEOUT", "3600"))  # seconds (default 60 min)
+CLAUDE_SOFT_CAP_BUFFER = int(os.environ.get("CLAUDE_REMOTE_SOFT_CAP_BUFFER", "600"))  # soft cap = timeout - buffer (default 10 min before)
 MAX_RESPONSE_LEN = 50_000  # chars
+JOURNAL_DIR = Path(os.environ.get("CLAUDE_REMOTE_JOURNAL_DIR", str(Path.home() / "projects" / "journal")))
 CLAUDE_CWD = os.environ.get("CLAUDE_REMOTE_CWD", str(Path.home() / "Projects"))
 SUBJECT_PREFIX = "cc"
 REPLY_SENDER_NAME = "ClaudeRemote"  # Display name on reply emails
@@ -811,6 +813,185 @@ def _check_cancel(thread_id: str) -> bool:
     return False
 
 
+def _parse_json_output(raw: str) -> str:
+    """Extract the result text from claude --output-format json."""
+    raw = raw.strip()
+    if not raw:
+        return ""
+    try:
+        data = json.loads(raw)
+        result = data.get("result", "")
+        turns = data.get("num_turns", "?")
+        cost = data.get("total_cost_usd")
+        cost_str = f"${cost:.2f}" if cost else "?"
+        log.info("Claude JSON output: %d chars, %s turns, cost %s", len(result), turns, cost_str)
+        return result.strip() if result else ""
+    except (json.JSONDecodeError, TypeError):
+        # If JSON parsing fails, fall back to raw text
+        log.warning("Failed to parse Claude JSON output (%d chars), using raw", len(raw))
+        return raw
+
+
+def _create_timeout_journal(session_id: str, message: str, elapsed: int) -> Optional[str]:
+    """Create a journal doc for timed-out tasks. Returns the file path or None."""
+    try:
+        today = datetime.now().strftime("%Y-%m-%d")
+        slug = session_id[:8]
+        filename = f"{today}-claude-remote-timeout-{slug}.md"
+        doc_path = JOURNAL_DIR / "docs" / filename
+
+        # Truncate the original message for the doc
+        msg_preview = message[:2000] + ("..." if len(message) > 2000 else "")
+
+        content = f"""# Claude Remote Timeout Report
+
+**Session:** `{session_id}`
+**Date:** {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
+**Elapsed:** {elapsed // 60} minutes {elapsed % 60} seconds
+**Timeout:** {CLAUDE_TIMEOUT // 60} minutes (soft cap at {(CLAUDE_TIMEOUT - CLAUDE_SOFT_CAP_BUFFER) // 60} min)
+
+## Original Request
+
+{msg_preview}
+
+## Status
+
+This task hit the time limit before Claude could produce a final summary.
+The session (`{session_id}`) can be resumed with `/resume` in the Slack thread.
+
+## What to do
+
+1. Reply in the Slack thread to continue where it left off
+2. Break the task into smaller steps
+3. Check if partial work was completed (PRs, branches, files)
+"""
+
+        doc_path.parent.mkdir(parents=True, exist_ok=True)
+        doc_path.write_text(content)
+        log.info("Created timeout journal doc: %s", doc_path)
+
+        # Try to commit and push to journal repo
+        journal_root = JOURNAL_DIR
+        try:
+            subprocess.run(
+                ["git", "add", str(doc_path)],
+                cwd=str(journal_root), capture_output=True, timeout=10,
+            )
+            subprocess.run(
+                ["git", "commit", "-m", f"Claude Remote timeout report ({slug})"],
+                cwd=str(journal_root), capture_output=True, timeout=10,
+            )
+            subprocess.run(
+                ["git", "push"],
+                cwd=str(journal_root), capture_output=True, timeout=30,
+            )
+            log.info("Pushed timeout journal doc to git")
+        except Exception as e:
+            log.warning("Failed to git push journal doc: %s", e)
+
+        return str(doc_path)
+    except Exception as e:
+        log.error("Failed to create timeout journal doc: %s", e)
+        return None
+
+
+def _soft_cap_summarize(proc, session_id: str, elapsed: int, message: str) -> str:
+    """Send SIGINT for graceful stop, then resume to ask for a summary."""
+    log.warning(
+        "Soft cap reached at %d min for session %s, sending SIGINT",
+        elapsed // 60, session_id[:8],
+    )
+    try:
+        proc.send_signal(signal.SIGINT)
+    except OSError:
+        pass
+
+    # Wait up to 30s for graceful exit
+    try:
+        proc.wait(timeout=30)
+    except subprocess.TimeoutExpired:
+        log.warning("SIGINT didn't stop Claude in 30s, killing")
+        proc.kill()
+        proc.wait()
+
+    # Read whatever output was produced before the interrupt
+    partial_output = proc.stdout.read().strip()
+    partial_result = _parse_json_output(partial_output) if partial_output else ""
+
+    # Resume the session to ask for a summary
+    log.info("Resuming session %s for soft-cap summary", session_id[:8])
+    summary_prompt = (
+        "You were interrupted because you're approaching the time limit. "
+        "STOP all tool use. Summarize what you've accomplished so far, "
+        "what remains to be done, and any findings or partial results. "
+        "Be concise but thorough."
+    )
+
+    env = os.environ.copy()
+    env.pop("CLAUDECODE", None)
+
+    summary_cmd = [
+        "claude", "-p", "--output-format", "json", "--dangerously-skip-permissions",
+        "--resume", session_id, summary_prompt,
+    ]
+
+    try:
+        summary_proc = subprocess.run(
+            summary_cmd, capture_output=True, text=True,
+            env=env, cwd=CLAUDE_CWD, timeout=300,  # 5 min max for summary
+        )
+        summary_text = _parse_json_output(summary_proc.stdout)
+    except (subprocess.TimeoutExpired, Exception) as e:
+        log.warning("Summary resume failed: %s", e)
+        summary_text = ""
+
+    # Create journal doc
+    journal_path = _create_timeout_journal(session_id, message, elapsed)
+
+    # If we got a summary, append it to the journal doc
+    if summary_text and journal_path:
+        try:
+            with open(journal_path, "a") as f:
+                f.write(f"\n## Claude's Summary (auto-generated at soft cap)\n\n{summary_text}\n")
+            # Re-commit with the summary
+            journal_root = JOURNAL_DIR
+            subprocess.run(
+                ["git", "add", journal_path],
+                cwd=str(journal_root), capture_output=True, timeout=10,
+            )
+            subprocess.run(
+                ["git", "commit", "-m", f"Update timeout report with Claude summary ({session_id[:8]})"],
+                cwd=str(journal_root), capture_output=True, timeout=10,
+            )
+            subprocess.run(
+                ["git", "push"],
+                cwd=str(journal_root), capture_output=True, timeout=30,
+            )
+        except Exception as e:
+            log.warning("Failed to update journal doc with summary: %s", e)
+
+    # Build the final output
+    parts = []
+    if summary_text:
+        parts.append(summary_text)
+    elif partial_result:
+        parts.append(partial_result)
+
+    parts.append(
+        f"\n\n:hourglass: *Hit the soft time cap ({elapsed // 60} min).* "
+        f"Session `{session_id[:8]}` can be resumed."
+    )
+
+    if journal_path:
+        # Convert to relative path for display
+        rel_path = journal_path.replace(str(Path.home()), "~")
+        parts.append(f"\n:notebook: Full report saved to `{rel_path}`")
+
+    parts.append("\nReply in this thread to continue, or `/resume` to pick up the session.")
+
+    return "\n".join(parts)
+
+
 def invoke_claude(
     message: str,
     session_id: Optional[str] = None,
@@ -818,7 +999,12 @@ def invoke_claude(
     on_progress: Optional[object] = None,
     thread_id: Optional[str] = None,
 ) -> str:
-    """Run claude -p as a subprocess, sending progress callbacks while waiting."""
+    """Run claude -p as a subprocess, sending progress callbacks while waiting.
+
+    Uses JSON output format to capture results even when Claude spends all its
+    time on tool calls. Implements a soft cap (SIGINT + summary) before the
+    hard timeout (SIGKILL).
+    """
     if session_id is None:
         session_id = str(uuid.uuid4())
 
@@ -829,14 +1015,18 @@ def invoke_claude(
     env = os.environ.copy()
     env.pop("CLAUDECODE", None)  # Strip nested session guard
 
-    cmd = ["claude", "-p", "--output-format", "text", "--dangerously-skip-permissions"]
+    cmd = ["claude", "-p", "--output-format", "json", "--dangerously-skip-permissions"]
     if resume:
         cmd.extend(["--resume", session_id])
     else:
         cmd.extend(["--session-id", session_id])
     cmd.append(message)
 
-    log.info("Invoking Claude (resume=%s, session=%s)", resume, session_id[:8])
+    soft_cap = CLAUDE_TIMEOUT - CLAUDE_SOFT_CAP_BUFFER
+    log.info(
+        "Invoking Claude (resume=%s, session=%s, timeout=%dmin, soft_cap=%dmin)",
+        resume, session_id[:8], CLAUDE_TIMEOUT // 60, soft_cap // 60,
+    )
 
     try:
         proc = subprocess.Popen(
@@ -845,31 +1035,41 @@ def invoke_claude(
         )
         elapsed = 0
         next_progress = PROGRESS_INTERVAL
+        next_log = 60  # Log every 60s that Claude is still running
         while proc.poll() is None:
             time.sleep(1)
             elapsed += 1
-            if thread_id and _check_cancel(thread_id):
-                proc.kill()
-                proc.wait()
-                log.info("Cancelled Claude for thread %s", thread_id)
-                return "[Cancelled by user]\n\nThe task was cancelled. Send a new message to start fresh."
-            if elapsed >= CLAUDE_TIMEOUT:
-                proc.kill()
-                proc.wait()
-                output = (
-                    f"[Timed out after {CLAUDE_TIMEOUT // 60} minutes]\n\n"
-                    "The task was too long for a single request. You can:\n"
-                    "- Reply in this thread to continue where it left off\n"
-                    "- Break the task into smaller steps\n"
-                    "- Reply /resume to pick up the session"
+
+            # Periodic activity logging
+            if elapsed >= next_log:
+                log.info(
+                    "Claude still running (session=%s, elapsed=%dm%ds, pid=%d)",
+                    session_id[:8], elapsed // 60, elapsed % 60, proc.pid,
                 )
-                log.warning("Claude timed out for session %s", session_id[:8])
+                next_log += 60
+
+            if thread_id and _check_cancel(thread_id):
+                log.info("Cancelling Claude for thread %s (elapsed=%ds)", thread_id, elapsed)
+                proc.kill()
+                proc.wait()
+                return "[Cancelled by user]\n\nThe task was cancelled. Send a new message to start fresh."
+
+            # Soft cap: graceful stop + summary
+            if elapsed >= soft_cap:
+                log.warning(
+                    "Soft cap reached for session %s at %dm (hard cap at %dm)",
+                    session_id[:8], elapsed // 60, CLAUDE_TIMEOUT // 60,
+                )
+                output = _soft_cap_summarize(proc, session_id, elapsed, message)
                 break
+
             if on_progress and elapsed >= next_progress:
                 on_progress(elapsed)
                 next_progress += PROGRESS_INTERVAL
         else:
-            output = proc.stdout.read().strip()
+            raw_output = proc.stdout.read().strip()
+            output = _parse_json_output(raw_output)
+
             if proc.returncode != 0 and not output:
                 stderr_text = proc.stderr.read().strip()
                 output = (
@@ -877,10 +1077,23 @@ def invoke_claude(
                     + (f"Error: {stderr_text}\n\n" if stderr_text else "")
                     + "Reply in this thread to retry, or start a new thread with cc prefix."
                 )
-            if not output:
+                log.error("Claude exited with code %d (session=%s)", proc.returncode, session_id[:8])
+            elif not output:
+                # Even with JSON format, output can be empty if Claude produced no text
+                log.warning(
+                    "Claude returned empty result (session=%s, returncode=%d, raw_len=%d)",
+                    session_id[:8], proc.returncode, len(raw_output),
+                )
                 output = (
                     "[Claude returned empty output]\n\n"
-                    "This sometimes happens with very short tasks. Try rephrasing your request."
+                    "Claude completed but produced no text response (all work was via tool calls). "
+                    "Reply in this thread to ask for a summary of what was done, "
+                    "or check for any PRs/branches that were created."
+                )
+            else:
+                log.info(
+                    "Claude completed (session=%s, elapsed=%ds, output=%d chars)",
+                    session_id[:8], elapsed, len(output),
                 )
     except FileNotFoundError:
         output = (

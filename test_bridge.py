@@ -521,16 +521,23 @@ class TestInvokeClaudeErrors:
     """Error messages from invoke_claude must contain actionable guidance."""
 
     def test_timeout_message_has_recovery_steps(self):
+        """Soft cap triggers SIGINT, summary resume, and journal doc."""
         with mock.patch("subprocess.Popen") as mock_popen:
             proc = mock.MagicMock()
             proc.poll.return_value = None  # never finishes
+            proc.stdout.read.return_value = ""
+            proc.pid = 12345
             mock_popen.return_value = proc
-            with mock.patch.object(bridge, "CLAUDE_TIMEOUT", 2):
-                with mock.patch("time.sleep"):
-                    result = bridge.invoke_claude("hi", "sess-1")
-        assert "Timed out" in result
-        assert "/resume" in result
-        assert "smaller steps" in result
+            with mock.patch.object(bridge, "CLAUDE_TIMEOUT", 2), \
+                 mock.patch.object(bridge, "CLAUDE_SOFT_CAP_BUFFER", 0), \
+                 mock.patch.object(bridge, "JOURNAL_DIR", Path("/tmp/test-journal")), \
+                 mock.patch("subprocess.run") as mock_run, \
+                 mock.patch("time.sleep"):
+                mock_run.return_value = mock.MagicMock(stdout='{"result":"summary"}')
+                result = bridge.invoke_claude("hi", "sess-1")
+        assert "soft time cap" in result.lower()
+        assert "resumed" in result.lower() or "resume" in result.lower()
+        proc.send_signal.assert_called()  # SIGINT sent for graceful stop
 
     def test_nonzero_exit_message_has_retry_hint(self):
         with mock.patch("subprocess.Popen") as mock_popen:
@@ -563,7 +570,7 @@ class TestInvokeClaudeErrors:
             with mock.patch("time.sleep"):
                 result = bridge.invoke_claude("hi", "sess-4")
         assert "empty output" in result.lower()
-        assert "rephrasing" in result.lower()
+        assert "tool calls" in result.lower() or "rephrasing" in result.lower()
 
     def test_invoke_claude_with_no_session_id(self):
         """invoke_claude should auto-generate session_id when None."""
