@@ -2608,9 +2608,11 @@ def slack_poll_cycle(token: str, state: dict):
 
         # Build prompt for Claude
         no_post = (
-            "SLACK POSTING RULE: Do NOT use slack_send_message or any Slack posting/messaging tool. "
-            "Your text response will be automatically posted to the thread. "
-            "You may use Slack read/search tools for research."
+            f"SLACK POSTING RULE: Your text response will be automatically posted to "
+            f"channel {channel_id}, thread {thread_ts}. Do NOT use slack_send_message to "
+            f"post in this same channel/thread (it will double-post). However, you MAY use "
+            f"slack_send_message to DM other users or post in OTHER channels when the user "
+            f"explicitly asks you to. You may use all Slack read/search tools freely."
         )
         if resume:
             prompt = text
@@ -2789,9 +2791,11 @@ def slack_cross_channel_cycle(token: str, state: dict):
 
         # Build prompt with posting scope restriction
         no_post_rule = (
-            f"SLACK POSTING RULE: Do NOT use slack_send_message or any Slack posting/messaging tool. "
-            f"Your text response will be automatically posted to channel {channel_id}, thread {thread_ts}. "
-            f"You may use Slack read/search tools for research."
+            f"SLACK POSTING RULE: Your text response will be automatically posted to "
+            f"channel {channel_id}, thread {thread_ts}. Do NOT use slack_send_message to "
+            f"post in this same channel/thread (it will double-post). However, you MAY use "
+            f"slack_send_message to DM other users or post in OTHER channels when the user "
+            f"explicitly asks you to. You may use all Slack read/search tools freely."
         )
         prompt = (
             f"{no_post_rule}\n\n"
