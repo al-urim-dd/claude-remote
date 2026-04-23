@@ -141,18 +141,18 @@ class TestRateLimiting:
     def test_allowed_when_empty(self, tmp_config):
         allowed, remaining = bridge._check_rate_limit()
         assert allowed is True
-        assert remaining == 20
+        assert remaining == bridge.RATE_LIMIT_PER_HOUR
 
     def test_allowed_after_one_invocation(self, tmp_config):
         bridge._record_invocation()
         allowed, remaining = bridge._check_rate_limit()
         assert allowed is True
-        assert remaining == 19
+        assert remaining == bridge.RATE_LIMIT_PER_HOUR - 1
 
     def test_blocked_at_limit(self, tmp_config):
-        """Should be blocked after 20 invocations in an hour."""
+        """Should be blocked after RATE_LIMIT_PER_HOUR invocations in an hour."""
         now = time.time()
-        timestamps = [now - i for i in range(20)]
+        timestamps = [now - i for i in range(bridge.RATE_LIMIT_PER_HOUR)]
         bridge.RATE_LIMIT_FILE.write_text(json.dumps(timestamps))
 
         allowed, remaining = bridge._check_rate_limit()
@@ -162,18 +162,18 @@ class TestRateLimiting:
     def test_old_entries_pruned(self, tmp_config):
         """Entries older than 1 hour should be pruned."""
         now = time.time()
-        old_timestamps = [now - 3700 for _ in range(20)]
+        old_timestamps = [now - 3700 for _ in range(bridge.RATE_LIMIT_PER_HOUR)]
         bridge.RATE_LIMIT_FILE.write_text(json.dumps(old_timestamps))
 
         allowed, remaining = bridge._check_rate_limit()
         assert allowed is True
-        assert remaining == 20
+        assert remaining == bridge.RATE_LIMIT_PER_HOUR
 
     def test_corrupt_json_handled(self, tmp_config):
         bridge.RATE_LIMIT_FILE.write_text("not json")
         allowed, remaining = bridge._check_rate_limit()
         assert allowed is True
-        assert remaining == 20
+        assert remaining == bridge.RATE_LIMIT_PER_HOUR
 
 
 # ---------------------------------------------------------------------------

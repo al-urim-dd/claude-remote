@@ -123,7 +123,7 @@ DIGEST_LAST_SENT_FILE = CONFIG_DIR / "digest_last_sent.txt"
 
 CANCEL_FILE = CONFIG_DIR / "cancel.txt"
 
-RATE_LIMIT_PER_HOUR = 20  # Max Claude invocations per hour
+RATE_LIMIT_PER_HOUR = int(os.environ.get("CLAUDE_REMOTE_RATE_LIMIT_PER_HOUR", "200"))
 RATE_LIMIT_FILE = CONFIG_DIR / "rate_limit.json"  # Tracks invocation timestamps
 
 SUMMARY_ENABLED = os.environ.get("CLAUDE_REMOTE_SUMMARY_ENABLED", "false").lower() == "true"
@@ -149,11 +149,22 @@ SLACK_BOT_TOKEN = os.environ.get("SLACK_BOT_TOKEN", "").strip()
 
 # Cross-channel invocation via @ClaudeRemote keyword search
 CROSS_CHANNEL_ENABLED = os.environ.get("CLAUDE_REMOTE_CROSS_CHANNEL", "true").lower() == "true"
+# Keyword trigger. Set to empty string to disable and rely solely on real
+# @-mentions of the bot (halves cross-channel search load under rate limits).
 CROSS_CHANNEL_TRIGGER = os.environ.get("CLAUDE_REMOTE_TRIGGER", "@ClaudeRemote")
 # When a bot token is configured, also treat real @-mentions of the bot as a
 # trigger. Slack renders @MXADXP in messages as <@{bot_uid}>. Set to "false" to
 # disable and only match the keyword trigger above.
 BOT_MENTION_ENABLED = os.environ.get("CLAUDE_REMOTE_BOT_MENTION", "true").lower() == "true"
+# Turn off polling of the private agent channel (#al-claude-remote) entirely,
+# so the only outbound Slack load is the cross-channel mention search. Useful
+# once the bot is installed in channels you care about and you interact via
+# @-mention or DM exclusively.
+DISABLE_PRIVATE_POLL = os.environ.get("CLAUDE_REMOTE_DISABLE_PRIVATE_POLL", "false").lower() == "true"
+
+# Messages we have already warned about being rate-limited. Re-attempted each
+# poll cycle (no re-log) until the hourly budget frees up and they land.
+_DEFERRED_MENTIONS: set = set()
 # Comma-separated list of user IDs allowed to trigger via @ClaudeRemote (in addition to SLACK_USER_ID)
 _extra_users = os.environ.get("CLAUDE_REMOTE_ALLOWED_USERS", "")
 CROSS_CHANNEL_ALLOWED_USERS: set[str] = {
@@ -3098,14 +3109,27 @@ def slack_cross_channel_cycle(token: str, state: dict):
     if not to_process:
         return
 
-    log.info("Cross-channel: found %d new mentions (triggers=%s)", len(to_process), strip_tokens)
+    # Filter out mentions we already logged as rate-limited so the log doesn't
+    # spam "found 1 new mention" every 15s for the same stuck message.
+    to_process_fresh = [m for m in to_process if m["ts"] not in _DEFERRED_MENTIONS]
+    if to_process_fresh:
+        log.info("Cross-channel: found %d new mentions (triggers=%s)",
+                 len(to_process_fresh), strip_tokens)
 
     # 3. Submit each to thread pool
     for msg in to_process:
         allowed, remaining = _check_rate_limit()
         if not allowed:
-            log.warning("Rate limit reached, skipping remaining cross-channel messages")
+            # Remember the ts so we (a) stop log-spamming and (b) pick it up
+            # automatically on the next poll cycle that has budget.
+            if msg["ts"] not in _DEFERRED_MENTIONS:
+                _DEFERRED_MENTIONS.add(msg["ts"])
+                log.warning(
+                    "Rate limit reached (%d/hr). Deferred %s in %s until budget frees.",
+                    RATE_LIMIT_PER_HOUR, msg["ts"], msg.get("channel_id", "?"),
+                )
             break
+        _DEFERRED_MENTIONS.discard(msg["ts"])
 
         # Strip every known trigger form (keyword, raw bot mention, @username)
         text = msg.get("text", "")
@@ -3300,6 +3324,12 @@ def run_bridge(foreground: bool = False, gmail_enabled: bool = True, slack_enabl
                     log.warning("SLACK_BOT_TOKEN set but invalid - falling back to user-token posting")
             else:
                 log.info("SLACK_BOT_TOKEN not set - posting as user (no self-notifications)")
+            log.info(
+                "Slack mode: private_poll=%s, cross_channel=%s, keyword_trigger=%r, bot_mention=%s, rate_limit=%d/hr",
+                not DISABLE_PRIVATE_POLL, CROSS_CHANNEL_ENABLED,
+                CROSS_CHANNEL_TRIGGER or "(disabled)", BOT_MENTION_ENABLED,
+                RATE_LIMIT_PER_HOUR,
+            )
             slack_state = load_slack_state()
             if not slack_state["channel_id"]:
                 log.info("No channel_id in state - resolving #%s via MCP search", SLACK_CHANNEL_NAME)
@@ -3369,26 +3399,28 @@ def run_bridge(foreground: bool = False, gmail_enabled: bool = True, slack_enabl
             if not is_business_hours():
                 log.debug("Outside business hours, skipping Slack poll")
             else:
-                try:
-                    # Re-read token each cycle in case Claude Code refreshed it
-                    slack_token = get_slack_token()
-                    if not slack_token:
-                        log.warning("Slack token expired or missing")
-                    else:
-                        log.info("Starting Slack poll cycle")
-                        slack_state = load_slack_state()
-                        slack_poll_cycle(slack_token, slack_state)
-                        log.info("Slack poll cycle complete")
-                except Exception:
-                    log.exception("Error in Slack poll cycle")
+                # Re-read token each cycle in case Claude Code refreshed it
+                slack_token = get_slack_token()
+                if not slack_token:
+                    log.warning("Slack token expired or missing")
+                else:
+                    # Private-channel poll (disabled when DISABLE_PRIVATE_POLL=true)
+                    if not DISABLE_PRIVATE_POLL:
+                        try:
+                            log.info("Starting Slack poll cycle")
+                            slack_state = load_slack_state()
+                            slack_poll_cycle(slack_token, slack_state)
+                            log.info("Slack poll cycle complete")
+                        except Exception:
+                            log.exception("Error in Slack poll cycle")
 
-                # Cross-channel @ClaudeRemote search
-                if CROSS_CHANNEL_ENABLED:
-                    try:
-                        slack_state = load_slack_state()
-                        slack_cross_channel_cycle(slack_token, slack_state)
-                    except Exception:
-                        log.exception("Error in cross-channel Slack cycle")
+                    # Cross-channel @MXADXP / @ClaudeRemote mention search
+                    if CROSS_CHANNEL_ENABLED:
+                        try:
+                            slack_state = load_slack_state()
+                            slack_cross_channel_cycle(slack_token, slack_state)
+                        except Exception:
+                            log.exception("Error in cross-channel Slack cycle")
 
         # --- Gmail poll ---
         if gmail_enabled:
