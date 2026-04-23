@@ -2039,6 +2039,55 @@ def mcp_read_thread(token: str, channel_id: str, message_ts: str) -> Optional[st
     return _extract_mcp_text(result)
 
 
+# Matches Slack permalinks like https://<team>.slack.com/archives/C123/p1712345678901234
+_SLACK_PERMALINK_RE = re.compile(
+    r"https://[a-z0-9.-]+\.slack\.com/archives/(?P<channel>[CDG][A-Z0-9]+)/p(?P<ts>\d+)"
+)
+
+
+def _permalink_to_channel_ts(url_match) -> Optional[tuple[str, str]]:
+    """Turn a permalink regex match into (channel_id, ts) in Slack API format."""
+    channel = url_match.group("channel")
+    ts_raw = url_match.group("ts")
+    # Slack permalinks encode the ts as <seconds><microseconds> with no dot,
+    # where <microseconds> is always 6 digits. Older message IDs can vary, so
+    # require at least 10 seconds digits + 6 microseconds = 16 chars.
+    if len(ts_raw) < 16:
+        return None
+    return channel, f"{ts_raw[:-6]}.{ts_raw[-6:]}"
+
+
+def _expand_slack_permalinks(token: str, text: str, *, max_links: int = 3,
+                             per_link_chars: int = 500,
+                             skip: Optional[set] = None) -> str:
+    """Find Slack permalinks in text, fetch each thread, return a capped summary.
+
+    Dedupes per invocation. `skip` can hold (channel, ts) pairs already included
+    as top-level thread context, to avoid fetching them again.
+    """
+    skip = skip or set()
+    seen: set = set()
+    parts: list[str] = []
+    for m in _SLACK_PERMALINK_RE.finditer(text):
+        parsed = _permalink_to_channel_ts(m)
+        if not parsed:
+            continue
+        if parsed in seen or parsed in skip:
+            continue
+        seen.add(parsed)
+        if len(parts) >= max_links:
+            break
+        channel, ts = parsed
+        body = mcp_read_thread(token, channel, ts)
+        if not body:
+            continue
+        trimmed = body.strip()
+        if len(trimmed) > per_link_chars:
+            trimmed = trimmed[:per_link_chars].rstrip() + " ...(truncated)"
+        parts.append(f"--- Linked Slack thread ({channel} ts={ts}) ---\n{trimmed}")
+    return "\n\n".join(parts)
+
+
 _SLACK_MAX_MSG_LEN = 4000  # Slack MCP rejects text > ~4000 chars (invalid_blocks)
 
 
@@ -3011,18 +3060,41 @@ def slack_cross_channel_cycle(token: str, state: dict):
             continue
 
         channel_id = msg["channel_id"]
+        is_thread_reply = bool(msg.get("thread_ts"))
         thread_ts = msg.get("thread_ts") or msg["ts"]
 
         # Acknowledge receipt
         mcp_add_reaction(token, channel_id, msg["ts"], "eyes")
 
-        session_id = str(uuid.uuid4())
-        log.info(
-            "Cross-channel submitting (channel=%s, session=%s): %.80s",
-            channel_id, session_id[:8], text,
+        # Fetch the full thread (parent + all replies, including prior bot
+        # responses) so follow-ups like "yes, go with A" have context.
+        thread_context = mcp_read_thread(token, channel_id, thread_ts) or ""
+
+        # Expand up to 3 Slack permalinks in the thread so references to other
+        # threads/messages come along. Skip the thread we just fetched.
+        link_context = _expand_slack_permalinks(
+            token,
+            thread_context + "\n" + text,
+            skip={(channel_id, thread_ts)},
         )
 
-        # Build prompt with posting scope restriction
+        # Resume an existing Claude session for this (channel, thread_ts) if one
+        # exists, so replies in the same thread carry implicit memory across
+        # cross-channel invocations.
+        session_key = f"{channel_id}:{thread_ts}"
+        thread_sessions = state.get("thread_sessions", {})
+        resume = session_key in thread_sessions
+        if resume:
+            session_id = thread_sessions[session_key]
+        else:
+            session_id = str(uuid.uuid4())
+
+        log.info(
+            "Cross-channel submitting (channel=%s, session=%s, resume=%s, reply=%s): %.80s",
+            channel_id, session_id[:8], resume, is_thread_reply, text,
+        )
+
+        # Build prompt with posting scope restriction + thread context + link context
         no_post_rule = (
             f"SLACK POSTING RULE: Your text response will be automatically posted to "
             f"channel {channel_id}, thread {thread_ts}. Do NOT use slack_send_message to "
@@ -3030,39 +3102,65 @@ def slack_cross_channel_cycle(token: str, state: dict):
             f"slack_send_message to DM other users or post in OTHER channels when the user "
             f"explicitly asks you to. You may use all Slack read/search tools freely."
         )
-        prompt = (
-            f"{no_post_rule}\n\n"
-            f"You are an AI assistant responding to a Slack message. "
-            f"The message is: {text}\n\n"
-            f"Process this as a task. Use all available MCP tools "
-            f"(Slack, Google Workspace, Glean, etc.) as needed. "
-            f"Use Slack mrkdwn formatting (*bold*, _italic_, `code`). "
-            f"Be concise and helpful."
+        context_instruction = (
+            "Before answering, read the FULL thread below - including prior replies from "
+            ":robot_face: (that is you in an earlier turn). If the latest message refers to "
+            "earlier content (e.g. 'option A', 'that link'), ground your answer in what was "
+            "actually said above. If any URLs (Confluence/Sigma/Chronosphere/Jira/etc.) or "
+            "Slack permalinks in the thread are relevant and not already expanded below, "
+            "use WebFetch, mcp__plugin_jira, or the appropriate MCP tool to read them before "
+            "responding."
         )
 
+        def _build_prompt(t: str, tc: str, lc: str) -> str:
+            role = (
+                "You are replying in an existing Slack thread."
+                if is_thread_reply
+                else "You are responding to a Slack message that tagged you."
+            )
+            parts: list[str] = [no_post_rule, "", role, "", context_instruction, ""]
+            parts.append(f"Channel: <#{channel_id}>")
+            parts.append(f"Thread ts: {thread_ts}")
+            if tc:
+                parts.append("")
+                parts.append("=== Full thread context ===")
+                parts.append(tc)
+                parts.append("=== End of thread ===")
+            if lc:
+                parts.append("")
+                parts.append("=== Linked Slack threads (already expanded) ===")
+                parts.append(lc)
+                parts.append("=== End of linked threads ===")
+            parts.append("")
+            parts.append(f"The user's latest message is: {t}")
+            parts.append("")
+            parts.append(
+                "Respond with Slack mrkdwn formatting (*bold*, _italic_, `code`). "
+                "Be concise and helpful. Do NOT repeat prior analysis verbatim - "
+                "build on it."
+            )
+            return "\n".join(parts)
+
+        prompt = _build_prompt(text, thread_context, link_context)
+
         _msg_ts = msg["ts"]
-        def _on_success(st, sid, mts=_msg_ts):
+        _session_key = session_key
+
+        def _on_success(st, sid, mts=_msg_ts, sk=_session_key):
             ids = set(st.get("search_processed_ids", []))
             ids.add(mts)
             st["search_processed_ids"] = list(ids)[-500:]
+            st.setdefault("thread_sessions", {})[sk] = sid
 
-        def _make_retry(t=text, npr=no_post_rule):
-            return (
-                f"{npr}\n\n"
-                f"You are an AI assistant responding to a Slack message. "
-                f"The message is: {t}\n\n"
-                f"Process this as a task. Use all available MCP tools "
-                f"(Slack, Google Workspace, Glean, etc.) as needed. "
-                f"Use Slack mrkdwn formatting (*bold*, _italic_, `code`). "
-                f"Be concise and helpful."
-            )
+        def _make_retry(t=text, tc=thread_context, lc=link_context, build=_build_prompt):
+            return build(t, tc, lc)
 
         processed.add(msg["ts"])
         _mark_inflight(msg["ts"])
         _executor.submit(
             _async_invoke_and_reply,
             token, channel_id, thread_ts, msg["ts"],
-            prompt, session_id, False, _on_success, _make_retry,
+            prompt, session_id, resume, _on_success, _make_retry,
             notify_user_id=msg.get("user_id", ""),
         )
 
