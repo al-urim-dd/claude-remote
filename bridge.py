@@ -150,6 +150,10 @@ SLACK_BOT_TOKEN = os.environ.get("SLACK_BOT_TOKEN", "").strip()
 # Cross-channel invocation via @ClaudeRemote keyword search
 CROSS_CHANNEL_ENABLED = os.environ.get("CLAUDE_REMOTE_CROSS_CHANNEL", "true").lower() == "true"
 CROSS_CHANNEL_TRIGGER = os.environ.get("CLAUDE_REMOTE_TRIGGER", "@ClaudeRemote")
+# When a bot token is configured, also treat real @-mentions of the bot as a
+# trigger. Slack renders @MXADXP in messages as <@{bot_uid}>. Set to "false" to
+# disable and only match the keyword trigger above.
+BOT_MENTION_ENABLED = os.environ.get("CLAUDE_REMOTE_BOT_MENTION", "true").lower() == "true"
 # Comma-separated list of user IDs allowed to trigger via @ClaudeRemote (in addition to SLACK_USER_ID)
 _extra_users = os.environ.get("CLAUDE_REMOTE_ALLOWED_USERS", "")
 CROSS_CHANNEL_ALLOWED_USERS: set[str] = {
@@ -2092,6 +2096,7 @@ def _sanitize_for_slack(text: str) -> str:
 
 
 _BOT_USER_ID_CACHE: Optional[str] = None
+_BOT_USERNAME_CACHE: Optional[str] = None
 _BOT_AUTH_CHECKED: bool = False
 _bot_auth_lock = threading.Lock()
 
@@ -2125,7 +2130,7 @@ def _slack_api(method: str, payload: dict, token: str, timeout: int = 15) -> dic
 
 def _get_bot_user_id() -> Optional[str]:
     """Run auth.test once, cache the bot's own user ID. None if bot token missing or invalid."""
-    global _BOT_USER_ID_CACHE, _BOT_AUTH_CHECKED
+    global _BOT_USER_ID_CACHE, _BOT_USERNAME_CACHE, _BOT_AUTH_CHECKED
     if not SLACK_BOT_TOKEN:
         return None
     with _bot_auth_lock:
@@ -2138,11 +2143,19 @@ def _get_bot_user_id() -> Optional[str]:
             _BOT_USER_ID_CACHE = None
             return None
         _BOT_USER_ID_CACHE = result.get("user_id") or None
+        _BOT_USERNAME_CACHE = result.get("user") or None
         log.info(
             "Bot token OK (user_id=%s, user=%s, team=%s)",
-            _BOT_USER_ID_CACHE, result.get("user", "?"), result.get("team", "?"),
+            _BOT_USER_ID_CACHE, _BOT_USERNAME_CACHE, result.get("team", "?"),
         )
         return _BOT_USER_ID_CACHE
+
+
+def _get_bot_username() -> Optional[str]:
+    """Return the bot's handle (e.g. 'mx_adxp_bot'). Requires auth.test to have run."""
+    if not _BOT_AUTH_CHECKED:
+        _get_bot_user_id()
+    return _BOT_USERNAME_CACHE
 
 
 def _bot_post_message(channel_id: str, thread_ts: str, message: str) -> tuple[bool, str]:
@@ -2887,25 +2900,64 @@ def slack_poll_cycle(token: str, state: dict):
 # ---------------------------------------------------------------------------
 
 
-def slack_cross_channel_cycle(token: str, state: dict):
-    """Search for @ClaudeRemote mentions across all channels and process them.
+def _build_cross_channel_triggers() -> tuple[list[str], list[str]]:
+    """Return (search_queries, strip_tokens).
 
-    Only explicit @ClaudeRemote mentions are processed - no implicit thread
-    follow-ups. Each invocation is submitted to the thread pool for concurrent
-    execution.
+    search_queries: one query per trigger form, used with slack_search_public_and_private.
+    strip_tokens: every textual form to both match-against and remove from prompts.
+    Slack search can return messages with mentions rendered as `<@U...>` OR as
+    the plain `@username`, depending on how the MCP formats results - accept both.
+    """
+    search_queries: list[str] = []
+    strip_tokens: list[str] = []
+    if CROSS_CHANNEL_TRIGGER:
+        search_queries.append(CROSS_CHANNEL_TRIGGER)
+        strip_tokens.append(CROSS_CHANNEL_TRIGGER)
+    if BOT_MENTION_ENABLED:
+        bot_uid = _get_bot_user_id()
+        bot_username = _get_bot_username()
+        if bot_uid:
+            raw = f"<@{bot_uid}>"
+            search_queries.append(raw)
+            strip_tokens.append(raw)
+        if bot_username:
+            strip_tokens.append(f"@{bot_username}")
+    return search_queries, strip_tokens
+
+
+def slack_cross_channel_cycle(token: str, state: dict):
+    """Search for trigger mentions across all channels and process them.
+
+    Triggers are either the keyword (CROSS_CHANNEL_TRIGGER, default
+    `@ClaudeRemote`) or a real @-mention of the bot (<@{bot_uid}>) when a
+    bot token is configured. Only explicit mentions are processed - no
+    implicit thread follow-ups. Each invocation is submitted to the thread
+    pool for concurrent execution.
     """
     if not CROSS_CHANNEL_ENABLED or not SLACK_USER_ID:
         return
 
-    # 1. Search for trigger mentions from today
-    today = datetime.now().strftime("%Y-%m-%d")
-    query = f"{CROSS_CHANNEL_TRIGGER} on:{today}"
-    search_text = mcp_search_messages(token, query)
-    if not search_text:
+    search_queries, strip_tokens = _build_cross_channel_triggers()
+    if not search_queries:
         return
 
-    results = parse_search_results(search_text)
-    if not results:
+    # 1. Search for trigger mentions from today. Run one search per trigger form
+    # and dedupe by message ts so the bridge picks up either form.
+    today = datetime.now().strftime("%Y-%m-%d")
+    all_results = []
+    seen_ts: set = set()
+    for query_text in search_queries:
+        query = f"{query_text} on:{today}"
+        search_text = mcp_search_messages(token, query)
+        if not search_text:
+            continue
+        for msg in parse_search_results(search_text):
+            ts = msg.get("ts")
+            if not ts or ts in seen_ts:
+                continue
+            seen_ts.add(ts)
+            all_results.append(msg)
+    if not all_results:
         return
 
     # 2. Filter out messages we shouldn't process
@@ -2913,7 +2965,7 @@ def slack_cross_channel_cycle(token: str, state: dict):
     processed = set(state.get("search_processed_ids", []))
 
     to_process = []
-    for msg in results:
+    for msg in all_results:
         # Security: only process messages from allowed users (or any user in open channels)
         is_open_channel = msg.get("channel_id") in CROSS_CHANNEL_OPEN_CHANNELS
         if not is_open_channel:
@@ -2929,15 +2981,18 @@ def slack_cross_channel_cycle(token: str, state: dict):
         # Skip agent replies
         if AGENT_PREFIX in msg.get("text", ""):
             continue
-        # Must contain the trigger
-        if CROSS_CHANNEL_TRIGGER not in msg.get("text", ""):
-            continue
+        # Must contain at least one trigger form (raw mention, username, or keyword)
+        text = msg.get("text", "")
+        if not any(t in text for t in strip_tokens):
+            # Search returned it but the rendered text has neither form. Trust
+            # the search (it would not have matched otherwise) and accept.
+            pass
         to_process.append(msg)
 
     if not to_process:
         return
 
-    log.info("Cross-channel: found %d new @ClaudeRemote mentions", len(to_process))
+    log.info("Cross-channel: found %d new mentions (triggers=%s)", len(to_process), strip_tokens)
 
     # 3. Submit each to thread pool
     for msg in to_process:
@@ -2946,8 +3001,11 @@ def slack_cross_channel_cycle(token: str, state: dict):
             log.warning("Rate limit reached, skipping remaining cross-channel messages")
             break
 
-        # Strip trigger prefix from text
-        text = msg.get("text", "").replace(CROSS_CHANNEL_TRIGGER, "").strip()
+        # Strip every known trigger form (keyword, raw bot mention, @username)
+        text = msg.get("text", "")
+        for tok in strip_tokens:
+            text = text.replace(tok, "")
+        text = text.strip()
         if not text:
             processed.add(msg["ts"])
             continue
