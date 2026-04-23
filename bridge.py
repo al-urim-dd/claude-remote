@@ -1943,11 +1943,18 @@ class McpError:
 _MCP_ERROR_GENERIC = McpError("unknown")
 
 
+_MCP_MAX_RETRIES = 2  # Extra attempts after the initial call (so up to 3 tries total)
+_MCP_RETRY_BACKOFF = (2.0, 5.0)  # Seconds to sleep on each retry if no Retry-After
+
+
 def _mcp_call(tool_name: str, arguments: dict, token: str) -> Optional[dict | McpError]:
     """Call a Slack MCP tool via HTTP JSON-RPC.
 
     Returns the result dict on success, or an McpError on failure (falsy, so
-    existing ``if result is None`` checks still work).
+    existing ``if result is None`` checks still work). On HTTP 429, honors the
+    Retry-After header (capped) and retries up to _MCP_MAX_RETRIES times with
+    a small backoff. 429s are logged at WARNING, not ERROR, since they are
+    expected load-shedding and already retried.
     """
     payload = json.dumps({
         "jsonrpc": "2.0",
@@ -1959,33 +1966,44 @@ def _mcp_call(tool_name: str, arguments: dict, token: str) -> Optional[dict | Mc
         },
     }).encode()
 
-    req = URLRequest(
-        MCP_URL,
-        data=payload,
-        headers={
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {token}",
-        },
-        method="POST",
-    )
-
-    try:
-        with urlopen(req, timeout=30) as resp:
-            body = json.loads(resp.read())
-            if "error" in body:
-                err = body["error"]
-                msg = err.get("message", str(err)) if isinstance(err, dict) else str(err)
-                code = err.get("code", 0) if isinstance(err, dict) else 0
-                log.error("MCP error: %s", err)
-                return McpError(msg, code)
-            return body.get("result", body)
-    except HTTPError as e:
-        msg = e.read().decode()[:500]
-        log.error("MCP HTTP error %d: %s", e.code, msg)
-        return McpError(msg, e.code)
-    except (URLError, TimeoutError) as e:
-        log.error("MCP connection error: %s", e)
-        return McpError(str(e))
+    for attempt in range(_MCP_MAX_RETRIES + 1):
+        req = URLRequest(
+            MCP_URL,
+            data=payload,
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {token}",
+            },
+            method="POST",
+        )
+        try:
+            with urlopen(req, timeout=30) as resp:
+                body = json.loads(resp.read())
+                if "error" in body:
+                    err = body["error"]
+                    msg = err.get("message", str(err)) if isinstance(err, dict) else str(err)
+                    code = err.get("code", 0) if isinstance(err, dict) else 0
+                    log.error("MCP error: %s", err)
+                    return McpError(msg, code)
+                return body.get("result", body)
+        except HTTPError as e:
+            msg = e.read().decode()[:500]
+            if e.code == 429 and attempt < _MCP_MAX_RETRIES:
+                retry_after = e.headers.get("Retry-After") if hasattr(e, "headers") else None
+                try:
+                    sleep_s = min(float(retry_after), 15.0) if retry_after else _MCP_RETRY_BACKOFF[attempt]
+                except (TypeError, ValueError):
+                    sleep_s = _MCP_RETRY_BACKOFF[attempt]
+                log.warning("MCP 429 on %s, retry %d/%d after %.1fs", tool_name, attempt + 1, _MCP_MAX_RETRIES, sleep_s)
+                time.sleep(sleep_s)
+                continue
+            log_fn = log.warning if e.code == 429 else log.error
+            log_fn("MCP HTTP error %d on %s: %s", e.code, tool_name, msg)
+            return McpError(msg, e.code)
+        except (URLError, TimeoutError) as e:
+            log.error("MCP connection error on %s: %s", tool_name, e)
+            return McpError(str(e))
+    return McpError("exhausted retries", 429)
 
 
 def _extract_mcp_text(result: dict) -> Optional[str]:
@@ -2028,15 +2046,43 @@ def mcp_read_channel(token: str, channel_id: str, oldest: str = "", limit: int =
     return _extract_mcp_text(result)
 
 
-def mcp_read_thread(token: str, channel_id: str, message_ts: str) -> Optional[str]:
-    """Read thread replies via MCP."""
+_THREAD_READ_CACHE: dict = {}
+_thread_read_lock = threading.Lock()
+_THREAD_READ_TTL_SECS = float(os.environ.get("CLAUDE_REMOTE_THREAD_CACHE_SECS", "30"))
+
+
+def mcp_read_thread(token: str, channel_id: str, message_ts: str,
+                    *, use_cache: bool = True) -> Optional[str]:
+    """Read thread replies via MCP with a short in-process cache.
+
+    The cache dedupes repeated reads of the same thread across poll cycles and
+    across permalink expansion - big help under Slack MCP rate limits. Set
+    use_cache=False for cross-channel processing where we want fresh context.
+    """
+    key = (channel_id, message_ts)
+    now = time.time()
+    if use_cache:
+        with _thread_read_lock:
+            cached = _THREAD_READ_CACHE.get(key)
+            if cached and (now - cached[0]) < _THREAD_READ_TTL_SECS:
+                return cached[1]
     result = _mcp_call("slack_read_thread", {
         "channel_id": channel_id,
         "message_ts": message_ts,
     }, token)
     if not result:
         return None
-    return _extract_mcp_text(result)
+    text = _extract_mcp_text(result)
+    if text is not None:
+        with _thread_read_lock:
+            _THREAD_READ_CACHE[key] = (now, text)
+            # Keep cache bounded
+            if len(_THREAD_READ_CACHE) > 500:
+                # Drop the 100 oldest entries
+                oldest = sorted(_THREAD_READ_CACHE.items(), key=lambda kv: kv[1][0])[:100]
+                for k, _ in oldest:
+                    _THREAD_READ_CACHE.pop(k, None)
+    return text
 
 
 # Matches Slack permalinks like https://<team>.slack.com/archives/C123/p1712345678901234
@@ -2573,6 +2619,14 @@ def parse_search_results(search_text: str) -> list:
                 current["permalink"] = url_match.group(1)
             else:
                 current["permalink"] = stripped[len("Permalink:"):].strip()
+            # MCP search omits a dedicated Thread_ts field and instead encodes
+            # the parent as a ?thread_ts=<ts> query parameter on the permalink.
+            # Extract it so thread-reply mentions are treated as replies, not
+            # as fresh top-level posts.
+            if not current.get("thread_ts"):
+                tts_match = re.search(r"[?&]thread_ts=([\d.]+)", current.get("permalink", ""))
+                if tts_match:
+                    current["thread_ts"] = tts_match.group(1)
         elif stripped.startswith("Text:"):
             # Text field - may have content on same line or next lines
             text_val = stripped[len("Text:"):].strip()
@@ -2920,8 +2974,11 @@ def slack_poll_cycle(token: str, state: dict):
         if float(msg.get("ts", "0")) > float(newest_top_ts):
             newest_top_ts = msg["ts"]
 
-    # Prune stale threads (>7 days)
-    cutoff = time.time() - 7 * 86400
+    # Prune stale threads. Default is aggressive (1 day) since each active
+    # thread costs 1 slack_read_thread call per poll cycle, and the Slack MCP
+    # rate-limits at ~20/min per method. Tune via CLAUDE_REMOTE_THREAD_TTL_DAYS.
+    ttl_days = float(os.environ.get("CLAUDE_REMOTE_THREAD_TTL_DAYS", "1"))
+    cutoff = time.time() - ttl_days * 86400
     pruned_sessions = []
     for k, v in list(active_threads.items()):
         if float(v) <= cutoff:
