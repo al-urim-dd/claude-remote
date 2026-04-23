@@ -49,19 +49,29 @@ from googleapiclient.discovery import build
 # ---------------------------------------------------------------------------
 
 CONFIG_DIR = Path.home() / ".claude-remote"
+_SCRIPT_DIR = Path(__file__).resolve().parent
 
-# Load env overrides from ~/.claude-remote/env
-_env_file = CONFIG_DIR / "env"
-if _env_file.is_file():
-    with open(_env_file) as _f:
+
+def _load_env_file(path: Path) -> None:
+    """Parse KEY=VALUE pairs into os.environ without overwriting existing vars."""
+    if not path.is_file():
+        return
+    with open(path) as _f:
         for _line in _f:
             _line = _line.strip()
-            if _line and not _line.startswith("#") and "=" in _line:
-                if _line.startswith("export "):
-                    _line = _line[7:]
-                _key, _, _val = _line.partition("=")
-                _val = _val.strip('"').strip("'").replace("$HOME", str(Path.home()))
-                os.environ.setdefault(_key.strip(), _val)
+            if not _line or _line.startswith("#") or "=" not in _line:
+                continue
+            if _line.startswith("export "):
+                _line = _line[7:]
+            _key, _, _val = _line.partition("=")
+            _val = _val.strip('"').strip("'").replace("$HOME", str(Path.home()))
+            os.environ.setdefault(_key.strip(), _val)
+
+
+# Load env overrides. Project .env wins by being loaded first (setdefault skips
+# already-set keys), then ~/.claude-remote/env fills in anything still missing.
+_load_env_file(_SCRIPT_DIR / ".env")
+_load_env_file(CONFIG_DIR / "env")
 
 CLIENT_SECRET = CONFIG_DIR / "client_secret.json"
 TOKEN_FILE = CONFIG_DIR / "token.json"
@@ -131,6 +141,11 @@ BUSINESS_HOURS_ONLY = os.environ.get("CLAUDE_REMOTE_BIZ_ONLY", "false").lower() 
 SLACK_CHANNEL_NAME = os.environ.get("CLAUDE_REMOTE_SLACK_CHANNEL", "your-agent-channel")
 SLACK_USER_ID = os.environ.get("CLAUDE_REMOTE_SLACK_USER_ID", "")  # auto-resolved at startup if empty
 SLACK_NOTIFY_THRESHOLD = int(os.environ.get("CLAUDE_REMOTE_NOTIFY_THRESHOLD", "30"))  # seconds
+
+# Optional bot token (xoxb-*). When set, outbound writes (chat.postMessage,
+# reactions.add, error DMs) go through the bot so pings come from the bot
+# instead of the user's own account (which suppresses self-notifications).
+SLACK_BOT_TOKEN = os.environ.get("SLACK_BOT_TOKEN", "").strip()
 
 # Cross-channel invocation via @ClaudeRemote keyword search
 CROSS_CHANNEL_ENABLED = os.environ.get("CLAUDE_REMOTE_CROSS_CHANNEL", "true").lower() == "true"
@@ -1298,12 +1313,12 @@ def _async_invoke_and_reply(
         else:
             reply_text = f"{AGENT_PREFIX} {response}"
 
-        success = mcp_send_message(token, channel_id, thread_ts, reply_text)
+        success = mcp_send_message(token, channel_id, thread_ts, reply_text, notify_user_id=notify_user_id)
         if not success and len(reply_text) > 4000:
             # Retry with truncated message (Slack has ~4000 char limit per block)
             log.warning("Reply too long (%d chars), retrying truncated", len(reply_text))
             truncated = reply_text[:3900] + "\n\n_(truncated, response was too long for Slack)_"
-            success = mcp_send_message(token, channel_id, thread_ts, truncated)
+            success = mcp_send_message(token, channel_id, thread_ts, truncated, notify_user_id=notify_user_id)
         if not success and notify_user_id:
             # Fallback: DM the requester (handles Slack Connect channels etc.)
             log.warning("Thread reply failed, falling back to DM for %s", notify_user_id)
@@ -1313,7 +1328,7 @@ def _async_invoke_and_reply(
             )
             if len(dm_text) > 4000:
                 dm_text = dm_text[:3900] + "\n\n_(truncated)_"
-            success = mcp_send_message(token, notify_user_id, "", dm_text)
+            success = mcp_send_message(token, notify_user_id, "", dm_text, notify_user_id=notify_user_id)
             if success:
                 log.info("Sent DM fallback to %s", notify_user_id)
         if success:
@@ -1764,7 +1779,20 @@ SLACK_TOKEN_REFRESH_HOURS = int(os.environ.get("CLAUDE_REMOTE_SLACK_REFRESH_HOUR
 
 
 def _notify_refresh_failure(entry: dict, error_msg: str):
-    """Send a Slack notification when token refresh fails."""
+    """Notify the user when the user's MCP OAuth token refresh fails.
+
+    Prefers the bot DM path (static bot token keeps working even when the
+    user's MCP token is broken). Falls back to MCP+channel if no bot token.
+    """
+    msg = (
+        f"{AGENT_PREFIX} :warning: {error_msg}\n"
+        f"Run `cd ~/Projects/claude-remote && .venv/bin/python slack_oauth.py` to re-authenticate."
+    )
+    # Primary: DM via bot (keeps working when user MCP token is dead)
+    if _notify_bot_error(error_msg, SLACK_USER_ID):
+        log.info("Sent token refresh failure notification via bot DM")
+        return
+    # Fallback: old path via user token + MCP
     token = entry.get("accessToken")
     if not token:
         return
@@ -1772,15 +1800,8 @@ def _notify_refresh_failure(entry: dict, error_msg: str):
         state = load_slack_state()
         channel_id = state.get("channel_id")
         if channel_id:
-            msg = (
-                f"{AGENT_PREFIX} :warning: {error_msg}\n"
-                f"Run `cd ~/Projects/claude-remote && .venv/bin/python slack_oauth.py` to re-authenticate."
-            )
-            _mcp_call("slack_send_message", {
-                "channel_id": channel_id,
-                "message": msg,
-            }, token)
-            log.info("Sent token refresh failure notification to Slack")
+            _mcp_call("slack_send_message", {"channel_id": channel_id, "message": msg}, token)
+            log.info("Sent token refresh failure notification via channel")
     except Exception as e:
         log.warning("Failed to send refresh failure notification: %s", e)
 
@@ -2060,79 +2081,235 @@ def _sanitize_for_slack(text: str) -> str:
     return text.strip()
 
 
-def slack_post_message_direct(token: str, channel_id: str, thread_ts: str, message: str) -> bool:
-    """Post a message via Slack chat.postMessage REST API directly.
+# ---------------------------------------------------------------------------
+# Slack bot token (direct REST API)
+#
+# When SLACK_BOT_TOKEN is set, outbound writes prefer the bot so pings come
+# from the bot instead of the user's own account (which Slack suppresses from
+# its own notifications). The user's MCP OAuth token is still used for reads
+# and to invite the bot into channels it is not yet a member of.
+# ---------------------------------------------------------------------------
 
-    Bypasses the MCP server, which blocks writes to Slack Connect
-    (externally shared) channels. The OAuth token works fine with
-    the REST API regardless of channel type.
-    """
-    payload = {"channel": channel_id, "text": message}
-    if thread_ts:
-        payload["thread_ts"] = thread_ts
-    data = json.dumps(payload).encode()
+
+_BOT_USER_ID_CACHE: Optional[str] = None
+_BOT_AUTH_CHECKED: bool = False
+_bot_auth_lock = threading.Lock()
+
+_ERROR_DM_THROTTLE_SECS = 60
+_error_dm_last_sent: dict = {}
+_error_dm_lock = threading.Lock()
+
+
+def _slack_api(method: str, payload: dict, token: str, timeout: int = 15) -> dict:
+    """POST https://slack.com/api/<method> as JSON. Returns parsed body or error dict."""
     req = URLRequest(
-        "https://slack.com/api/chat.postMessage",
-        data=data,
+        f"https://slack.com/api/{method}",
+        data=json.dumps(payload).encode(),
         headers={
-            "Content-Type": "application/json",
+            "Content-Type": "application/json; charset=utf-8",
             "Authorization": f"Bearer {token}",
         },
         method="POST",
     )
     try:
-        with urlopen(req, timeout=15) as resp:
-            body = json.loads(resp.read())
-            if body.get("ok"):
-                return True
-            log.error("slack_post_message_direct error: %s", body.get("error"))
-            return False
+        with urlopen(req, timeout=timeout) as resp:
+            return json.loads(resp.read())
+    except HTTPError as e:
+        try:
+            return json.loads(e.read())
+        except Exception:
+            return {"ok": False, "error": f"http_{e.code}"}
     except (URLError, TimeoutError) as e:
-        log.error("slack_post_message_direct network error: %s", e)
+        return {"ok": False, "error": "network_error", "detail": str(getattr(e, "reason", e))}
+
+
+def _get_bot_user_id() -> Optional[str]:
+    """Run auth.test once, cache the bot's own user ID. None if bot token missing or invalid."""
+    global _BOT_USER_ID_CACHE, _BOT_AUTH_CHECKED
+    if not SLACK_BOT_TOKEN:
+        return None
+    with _bot_auth_lock:
+        if _BOT_AUTH_CHECKED:
+            return _BOT_USER_ID_CACHE
+        _BOT_AUTH_CHECKED = True
+        result = _slack_api("auth.test", {}, SLACK_BOT_TOKEN)
+        if not result.get("ok"):
+            log.warning("SLACK_BOT_TOKEN auth.test failed: %s (bot disabled this session)", result.get("error", "unknown"))
+            _BOT_USER_ID_CACHE = None
+            return None
+        _BOT_USER_ID_CACHE = result.get("user_id") or None
+        log.info(
+            "Bot token OK (user_id=%s, user=%s, team=%s)",
+            _BOT_USER_ID_CACHE, result.get("user", "?"), result.get("team", "?"),
+        )
+        return _BOT_USER_ID_CACHE
+
+
+def _bot_post_message(channel_id: str, thread_ts: str, message: str) -> tuple[bool, str]:
+    """Post via bot token. Returns (ok, error_code). error_code is empty when ok."""
+    if not SLACK_BOT_TOKEN:
+        return (False, "no_bot_token")
+    payload: dict = {"channel": channel_id, "text": message}
+    if thread_ts:
+        payload["thread_ts"] = thread_ts
+    result = _slack_api("chat.postMessage", payload, SLACK_BOT_TOKEN)
+    if result.get("ok"):
+        return (True, "")
+    return (False, result.get("error", "unknown"))
+
+
+def _bot_add_reaction(channel_id: str, message_ts: str, emoji: str) -> tuple[bool, str]:
+    if not SLACK_BOT_TOKEN:
+        return (False, "no_bot_token")
+    result = _slack_api(
+        "reactions.add",
+        {"channel": channel_id, "timestamp": message_ts, "name": emoji},
+        SLACK_BOT_TOKEN,
+    )
+    if result.get("ok") or result.get("error") == "already_reacted":
+        return (True, "")
+    return (False, result.get("error", "unknown"))
+
+
+def _invite_bot_to_channel(user_token: str, channel_id: str, bot_uid: str) -> tuple[bool, str]:
+    """Use the user's OAuth token to add the bot to a channel it is not yet in."""
+    result = _slack_api(
+        "conversations.invite",
+        {"channel": channel_id, "users": bot_uid},
+        user_token,
+    )
+    if result.get("ok") or result.get("error") == "already_in_channel":
+        return (True, "")
+    return (False, result.get("error", "unknown"))
+
+
+def _notify_bot_error(summary: str, user_id: str = "") -> bool:
+    """Best-effort bot DM to ping the user about a send failure.
+
+    Throttled per (target, first 60 chars of summary) so transient flaps do not
+    spam. Always returns fast and never raises.
+    """
+    target = user_id or SLACK_USER_ID
+    if not target or not SLACK_BOT_TOKEN:
+        return False
+    now = time.time()
+    key = (target, summary[:60])
+    with _error_dm_lock:
+        last = _error_dm_last_sent.get(key, 0)
+        if now - last < _ERROR_DM_THROTTLE_SECS:
+            return False
+        _error_dm_last_sent[key] = now
+    try:
+        ok, err = _bot_post_message(target, "", f":warning: ClaudeRemote bot: {summary}")
+        if not ok:
+            log.warning("Bot error DM to %s failed: %s", target, err)
+        return ok
+    except Exception:
+        log.exception("Bot error DM crashed")
         return False
 
 
-def mcp_send_message(token: str, channel_id: str, thread_ts: str, message: str) -> bool:
-    """Send a message via MCP, chunking if it exceeds Slack's size limit.
+def slack_post_message_direct(token: str, channel_id: str, thread_ts: str, message: str) -> bool:
+    """Post via user token + chat.postMessage REST. Used as a fallback when MCP blocks the send."""
+    result = _slack_api(
+        "chat.postMessage",
+        {"channel": channel_id, "text": message, **({"thread_ts": thread_ts} if thread_ts else {})},
+        token,
+    )
+    if result.get("ok"):
+        return True
+    log.error("slack_post_message_direct error: %s", result.get("error"))
+    return False
 
-    On invalid_blocks errors, retries with sanitized content.
-    On any MCP failure, falls back to direct Slack API (handles Slack Connect
-    channels and other MCP restrictions).
+
+# Errors that mean "bot missing from channel". Retry after inviting.
+_BOT_INVITE_RETRY_ERRORS = {"not_in_channel", "channel_not_found"}
+
+
+def _legacy_user_token_send(token: str, channel_id: str, thread_ts: str, chunk: str) -> bool:
+    """Original MCP-first, direct-API-fallback path using the user's OAuth token."""
+    args: dict = {"channel_id": channel_id, "message": chunk}
+    if thread_ts:
+        args["thread_ts"] = thread_ts
+    result = _mcp_call("slack_send_message", args, token)
+    if result:
+        return True
+    if isinstance(result, McpError) and result.is_invalid_blocks:
+        sanitized = _sanitize_for_slack(chunk)
+        log.warning("invalid_blocks (%d chars), retrying sanitized (%d chars)", len(chunk), len(sanitized))
+        retry_args = {"channel_id": channel_id, "message": sanitized}
+        if thread_ts:
+            retry_args["thread_ts"] = thread_ts
+        result = _mcp_call("slack_send_message", retry_args, token)
+        if result:
+            return True
+        plaintext = re.sub(r"[*_~`#>\[\]]", "", sanitized)
+        plain_args = {"channel_id": channel_id, "message": plaintext}
+        if thread_ts:
+            plain_args["thread_ts"] = thread_ts
+        result = _mcp_call("slack_send_message", plain_args, token)
+        if result:
+            return True
+    log.warning("MCP send failed, falling back to direct user-token API (%d chars)", len(chunk))
+    return slack_post_message_direct(token, channel_id, thread_ts, chunk)
+
+
+def _send_chunk(user_token: str, channel_id: str, thread_ts: str, chunk: str,
+                bot_uid: Optional[str], notify_user_id: str) -> bool:
+    """Try bot first (auto-inviting on not_in_channel), then user-token fallback. DMs user on every fail path."""
+    # 1. Bot post
+    if bot_uid:
+        ok, err = _bot_post_message(channel_id, thread_ts, chunk)
+        if ok:
+            return True
+        # 2. Auto-invite the bot into the channel and retry once
+        if err in _BOT_INVITE_RETRY_ERRORS and channel_id.startswith(("C", "G")):
+            log.info("Bot not in %s (%s); attempting invite", channel_id, err)
+            invited, invite_err = _invite_bot_to_channel(user_token, channel_id, bot_uid)
+            if invited:
+                ok, err = _bot_post_message(channel_id, thread_ts, chunk)
+                if ok:
+                    log.info("Invited bot to %s and posted successfully", channel_id)
+                    return True
+                log.warning("Bot post to %s still failed after invite: %s", channel_id, err)
+                _notify_bot_error(
+                    f"Posted invite but bot still cannot post in <#{channel_id}>: {err}. Falling back.",
+                    notify_user_id,
+                )
+            else:
+                log.warning("Invite bot to %s failed: %s", channel_id, invite_err)
+                _notify_bot_error(
+                    f"Bot not in <#{channel_id}> and invite failed ({invite_err}). Falling back.",
+                    notify_user_id,
+                )
+        elif err and err != "no_bot_token":
+            # Other bot errors (e.g. invalid_auth, msg_too_long, restricted_action)
+            _notify_bot_error(f"Bot post to <#{channel_id}> failed: {err}. Falling back.", notify_user_id)
+
+    # 3. Fall back to user-token MCP/direct path so the bridge keeps working
+    if _legacy_user_token_send(user_token, channel_id, thread_ts, chunk):
+        return True
+
+    # 4. Everything failed - DM user as bot as a last-chance attention ping
+    _notify_bot_error(
+        f"Could not post to <#{channel_id}> via bot or user token. Reply was dropped.",
+        notify_user_id,
+    )
+    return False
+
+
+def mcp_send_message(token: str, channel_id: str, thread_ts: str, message: str,
+                     notify_user_id: str = "") -> bool:
+    """Send a Slack message. Bot-first, auto-invites bot to channels, falls back to user token.
+
+    `token` is the user's MCP OAuth token (also used for reads). `notify_user_id`
+    is the Slack user ID to DM via bot when something fails - defaults to
+    SLACK_USER_ID so Al always gets notified.
     """
     chunks = _split_message(message)
+    bot_uid = _get_bot_user_id()
     for i, chunk in enumerate(chunks):
-        args = {"channel_id": channel_id, "message": chunk}
-        if thread_ts:
-            args["thread_ts"] = thread_ts
-        result = _mcp_call("slack_send_message", args, token)
-        if result:
-            continue
-
-        # On invalid_blocks, retry with sanitized content via MCP
-        if isinstance(result, McpError) and result.is_invalid_blocks:
-            sanitized = _sanitize_for_slack(chunk)
-            log.warning("invalid_blocks on chunk %d/%d (%d chars), retrying sanitized (%d chars)",
-                        i + 1, len(chunks), len(chunk), len(sanitized))
-            retry_args = {"channel_id": channel_id, "message": sanitized}
-            if thread_ts:
-                retry_args["thread_ts"] = thread_ts
-            result = _mcp_call("slack_send_message", retry_args, token)
-            if result:
-                continue
-            # Try plaintext via MCP
-            plaintext = re.sub(r"[*_~`#>\[\]]", "", sanitized)
-            log.warning("Sanitized still failed, retrying as plaintext (%d chars)", len(plaintext))
-            plain_args = {"channel_id": channel_id, "message": plaintext}
-            if thread_ts:
-                plain_args["thread_ts"] = thread_ts
-            result = _mcp_call("slack_send_message", plain_args, token)
-            if result:
-                continue
-
-        # All MCP attempts failed. Fall back to direct Slack API
-        # (bypasses MCP restrictions like Slack Connect channel blocks).
-        log.warning("MCP send failed, falling back to direct Slack API for chunk %d/%d", i + 1, len(chunks))
-        if slack_post_message_direct(token, channel_id, thread_ts, chunk):
+        if _send_chunk(token, channel_id, thread_ts, chunk, bot_uid, notify_user_id):
             continue
         log.error("All send methods failed for chunk %d/%d (%d chars)", i + 1, len(chunks), len(chunk))
         return False
@@ -2140,36 +2317,33 @@ def mcp_send_message(token: str, channel_id: str, thread_ts: str, message: str) 
 
 
 def mcp_add_reaction(token: str, channel_id: str, message_ts: str, emoji: str = "eyes") -> bool:
-    """Add an emoji reaction to a message to acknowledge receipt.
+    """Add a reaction. Bot-first with auto-invite, falls back to user token.
 
-    Uses Slack Web API directly since the MCP server doesn't expose
-    reactions.add. The MCP OAuth token (xoxe.xoxp-*) works with the
-    Slack API.
+    Silent on failure (no DM) since emojis are acknowledgments, not content.
     """
-    payload = json.dumps({
-        "channel": channel_id,
-        "timestamp": message_ts,
-        "name": emoji,
-    }).encode()
-    req = URLRequest(
-        "https://slack.com/api/reactions.add",
-        data=payload,
-        headers={
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {token}",
-        },
-        method="POST",
-    )
-    try:
-        with urlopen(req, timeout=10) as resp:
-            body = json.loads(resp.read())
-            if not body.get("ok"):
-                log.warning("reactions.add failed: %s", body.get("error", "unknown"))
-                return False
+    bot_uid = _get_bot_user_id()
+    if bot_uid:
+        ok, err = _bot_add_reaction(channel_id, message_ts, emoji)
+        if ok:
             return True
-    except (HTTPError, URLError) as e:
-        log.warning("reactions.add error: %s", e)
-        return False
+        if err in _BOT_INVITE_RETRY_ERRORS and channel_id.startswith(("C", "G")):
+            invited, _ = _invite_bot_to_channel(token, channel_id, bot_uid)
+            if invited:
+                ok, _ = _bot_add_reaction(channel_id, message_ts, emoji)
+                if ok:
+                    return True
+
+    # Fall back to user token via direct API
+    result = _slack_api(
+        "reactions.add",
+        {"channel": channel_id, "timestamp": message_ts, "name": emoji},
+        token,
+        timeout=10,
+    )
+    if result.get("ok") or result.get("error") == "already_reacted":
+        return True
+    log.warning("reactions.add failed: %s", result.get("error", "unknown"))
+    return False
 
 
 def mcp_resolve_slack_user_id(token: str) -> Optional[str]:
@@ -2579,6 +2753,7 @@ def slack_poll_cycle(token: str, state: dict):
                 token, channel_id,
                 msg.get("thread_ts", msg["ts"]),
                 f"{AGENT_PREFIX} Rate limit reached (20/hour). Try again later.",
+                notify_user_id=msg.get("user_id", ""),
             )
             break
 
@@ -2902,6 +3077,16 @@ def run_bridge(foreground: bool = False, gmail_enabled: bool = True, slack_enabl
                     "Run any Slack MCP tool in Claude Code first to authenticate."
                 )
             log.info("Slack MCP token loaded successfully")
+            # Eager-validate the bot token so auth.test failures surface at startup,
+            # not on the first outbound message.
+            if SLACK_BOT_TOKEN:
+                bot_uid = _get_bot_user_id()
+                if bot_uid:
+                    log.info("Slack bot enabled (user_id=%s) - posting as bot", bot_uid)
+                else:
+                    log.warning("SLACK_BOT_TOKEN set but invalid - falling back to user-token posting")
+            else:
+                log.info("SLACK_BOT_TOKEN not set - posting as user (no self-notifications)")
             slack_state = load_slack_state()
             if not slack_state["channel_id"]:
                 log.info("No channel_id in state - resolving #%s via MCP search", SLACK_CHANNEL_NAME)
@@ -3240,6 +3425,11 @@ def main():
     # status subcommand
     subparsers.add_parser("status", help="Show bridge status")
 
+    # test-bot subcommand: validate SLACK_BOT_TOKEN end-to-end
+    test_bot = subparsers.add_parser("test-bot", help="Validate SLACK_BOT_TOKEN and send a test DM")
+    test_bot.add_argument("--to", default="", help="Slack user ID to DM (default: SLACK_USER_ID)")
+    test_bot.add_argument("--channel", default="", help="Channel ID to post a test message in (optional)")
+
     args = parser.parse_args()
 
     if not args.command:
@@ -3256,9 +3446,53 @@ def main():
         stop_daemon()
     elif args.command == "status":
         show_status()
+    elif args.command == "test-bot":
+        sys.exit(_cmd_test_bot(args))
     else:
         parser.print_help()
         sys.exit(1)
+
+
+def _cmd_test_bot(args) -> int:
+    """Validate bot token: run auth.test, DM the user, optionally post in a channel."""
+    setup_logging(foreground=True)
+    if not SLACK_BOT_TOKEN:
+        print("ERROR: SLACK_BOT_TOKEN is not set. Add it to .env and retry.", file=sys.stderr)
+        return 1
+    print(f"Testing bot token (prefix: {SLACK_BOT_TOKEN[:10]}...)")
+    bot_uid = _get_bot_user_id()
+    if not bot_uid:
+        print("ERROR: auth.test failed. Token is invalid or the bot lacks scopes.", file=sys.stderr)
+        return 1
+    print(f"OK: auth.test passed. Bot user_id = {bot_uid}")
+
+    target = args.to or SLACK_USER_ID or os.environ.get("CLAUDE_REMOTE_SLACK_USER_ID", "")
+    if not target:
+        print("WARN: no --to and no SLACK_USER_ID; skipping DM test")
+    else:
+        ok, err = _bot_post_message(
+            target, "",
+            ":wave: ClaudeRemote bot test DM. If you see this, error pings will work."
+        )
+        if ok:
+            print(f"OK: DM sent to {target}")
+        else:
+            print(f"ERROR: DM to {target} failed: {err}", file=sys.stderr)
+            return 1
+
+    if args.channel:
+        user_token = get_slack_token()
+        if not user_token:
+            print("WARN: no user MCP token available; cannot auto-invite on not_in_channel", file=sys.stderr)
+        ok = _send_chunk(
+            user_token or "", args.channel, "",
+            ":robot_face: ClaudeRemote bot test message.",
+            bot_uid, target,
+        )
+        print(f"{'OK' if ok else 'ERROR'}: channel test post to {args.channel}")
+        if not ok:
+            return 1
+    return 0
 
 
 if __name__ == "__main__":
