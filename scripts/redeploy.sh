@@ -82,27 +82,35 @@ fi
 log_info "monitoring log for ${WINDOW}s for anomalies"
 
 SCAN_FROM=$((BEFORE_BYTES+1))
-DEADLINE=$(($(date +%s) + WINDOW))
 INTERVAL=30
 ANOMALIES_FILE=$(mktemp)
 trap 'rm -f "$ANOMALIES_FILE"' EXIT
 
-while [[ $(date +%s) -lt $DEADLINE ]]; do
-    LEFT=$((DEADLINE - $(date +%s)))
-    SLEEP=$(( LEFT < INTERVAL ? LEFT : INTERVAL ))
-    [[ $SLEEP -gt 0 ]] && sleep "$SLEEP"
+# Build a single "benign" alternation pattern for counting
+BENIGN_ALT=""
+for p in "${BENIGN_GREP[@]}"; do
+    [[ "$p" == "-e" ]] && continue
+    BENIGN_ALT+="${BENIGN_ALT:+|}$p"
+done
+
+ELAPSED=0
+while [[ $ELAPSED -lt $WINDOW ]]; do
+    REMAINING=$((WINDOW - ELAPSED))
+    SLEEP=$(( REMAINING < INTERVAL ? REMAINING : INTERVAL ))
+    sleep "$SLEEP"
+    ELAPSED=$((ELAPSED + SLEEP))
 
     # Anomaly = ERROR or WARNING not in benign list
-    NEW=$(tail -c +"$SCAN_FROM" "$LOG" | grep -E " (ERROR|WARNING) " | grep -v "${BENIGN_GREP[@]}" || true)
+    NEW=$(tail -c +"$SCAN_FROM" "$LOG" | grep -E " (ERROR|WARNING) " | grep -vE "$BENIGN_ALT" || true)
     if [[ -n "$NEW" ]]; then
         echo "$NEW" >> "$ANOMALIES_FILE"
     fi
 
     ERRORS=$(tail -c +"$SCAN_FROM" "$LOG" | grep -cE " ERROR " || true)
     WARNS=$(tail -c +"$SCAN_FROM" "$LOG" | grep -cE " WARNING " || true)
-    BENIGN=$(tail -c +"$SCAN_FROM" "$LOG" | grep -cE "$(IFS=\|; echo "${BENIGN_GREP[*]#-e }" | tr ' ' '|')" || true)
-    POLLS=$(tail -c +"$SCAN_FROM" "$LOG" | grep -c "Cross-channel: found" || true)
-    log_info "elapsed=$((WINDOW - LEFT))s errors=$ERRORS warns=$WARNS benign=$BENIGN mentions_seen=$POLLS"
+    BENIGN=$(tail -c +"$SCAN_FROM" "$LOG" | grep -cE "$BENIGN_ALT" || true)
+    MENTIONS=$(tail -c +"$SCAN_FROM" "$LOG" | grep -c "Cross-channel: found" || true)
+    log_info "elapsed=${ELAPSED}s errors=$ERRORS warns=$WARNS benign=$BENIGN mentions_seen=$MENTIONS"
 done
 
 ANOM_COUNT=$(wc -l < "$ANOMALIES_FILE" | awk '{print $1+0}')
