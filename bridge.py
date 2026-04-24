@@ -149,18 +149,18 @@ SLACK_BOT_TOKEN = os.environ.get("SLACK_BOT_TOKEN", "").strip()
 
 # Cross-channel invocation via @ClaudeRemote keyword search
 CROSS_CHANNEL_ENABLED = os.environ.get("CLAUDE_REMOTE_CROSS_CHANNEL", "true").lower() == "true"
-# Keyword trigger. Set to empty string to disable and rely solely on real
-# @-mentions of the bot (halves cross-channel search load under rate limits).
-CROSS_CHANNEL_TRIGGER = os.environ.get("CLAUDE_REMOTE_TRIGGER", "@ClaudeRemote")
-# When a bot token is configured, also treat real @-mentions of the bot as a
-# trigger. Slack renders @MXADXP in messages as <@{bot_uid}>. Set to "false" to
-# disable and only match the keyword trigger above.
+# Keyword trigger. Default is empty — bot mention is the sole trigger. Set to
+# "@ClaudeRemote" (or anything else) to re-enable a keyword-based fallback.
+CROSS_CHANNEL_TRIGGER = os.environ.get("CLAUDE_REMOTE_TRIGGER", "")
+# When a bot token is configured, treat real @-mentions of the bot as a trigger.
+# Slack renders @MXADXP in messages as <@{bot_uid}>. Defaults on.
 BOT_MENTION_ENABLED = os.environ.get("CLAUDE_REMOTE_BOT_MENTION", "true").lower() == "true"
-# Turn off polling of the private agent channel (#al-claude-remote) entirely,
-# so the only outbound Slack load is the cross-channel mention search. Useful
-# once the bot is installed in channels you care about and you interact via
-# @-mention or DM exclusively.
-DISABLE_PRIVATE_POLL = os.environ.get("CLAUDE_REMOTE_DISABLE_PRIVATE_POLL", "false").lower() == "true"
+# Polling of the private agent channel (#al-claude-remote) is off by default.
+# You still use the channel, you just always @-mention the bot there, and it
+# gets picked up by the cross-channel mention search - the same way as any
+# other channel the bot is in. Set "false" to re-enable the old read-every-
+# message loop.
+DISABLE_PRIVATE_POLL = os.environ.get("CLAUDE_REMOTE_DISABLE_PRIVATE_POLL", "true").lower() == "true"
 
 # Messages we have already warned about being rate-limited. Re-attempted each
 # poll cycle (no re-log) until the hourly budget frees up and they land.
