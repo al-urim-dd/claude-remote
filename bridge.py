@@ -125,6 +125,8 @@ CANCEL_FILE = CONFIG_DIR / "cancel.txt"
 
 RATE_LIMIT_PER_HOUR = int(os.environ.get("CLAUDE_REMOTE_RATE_LIMIT_PER_HOUR", "200"))
 RATE_LIMIT_FILE = CONFIG_DIR / "rate_limit.json"  # Tracks invocation timestamps
+INFLIGHT_FILE = CONFIG_DIR / "inflight.json"      # In-flight Claude invocations for `bridge.py status`
+_inflight_file_lock = threading.Lock()
 
 SUMMARY_ENABLED = os.environ.get("CLAUDE_REMOTE_SUMMARY_ENABLED", "false").lower() == "true"
 SUMMARY_HOUR = int(os.environ.get("CLAUDE_REMOTE_SUMMARY_HOUR", "22"))
@@ -1028,6 +1030,7 @@ def invoke_claude(
     resume: bool = False,
     on_progress: Optional[object] = None,
     thread_id: Optional[str] = None,
+    log_tag: str = "",
 ) -> str:
     """Run claude -p as a subprocess, sending progress callbacks while waiting.
 
@@ -1054,8 +1057,9 @@ def invoke_claude(
 
     soft_cap = CLAUDE_TIMEOUT - CLAUDE_SOFT_CAP_BUFFER
     log.info(
-        "Invoking Claude (resume=%s, session=%s, timeout=%dmin, soft_cap=%dmin)",
+        "Invoking Claude (resume=%s, session=%s, timeout=%dmin, soft_cap=%dmin)%s",
         resume, session_id[:8], CLAUDE_TIMEOUT // 60, soft_cap // 60,
+        f" {log_tag}" if log_tag else "",
     )
 
     try:
@@ -1073,8 +1077,9 @@ def invoke_claude(
             # Periodic activity logging
             if elapsed >= next_log:
                 log.info(
-                    "Claude still running (session=%s, elapsed=%dm%ds, pid=%d)",
+                    "Claude still running (session=%s, elapsed=%dm%ds, pid=%d)%s",
                     session_id[:8], elapsed // 60, elapsed % 60, proc.pid,
+                    f" {log_tag}" if log_tag else "",
                 )
                 next_log += 60
 
@@ -1300,24 +1305,27 @@ def _async_invoke_and_reply(
     on_success,
     make_retry_prompt=None,
     notify_user_id: str = "",
+    log_tag: str = "",
 ):
     """Process a Claude invocation in a background thread.
 
     on_success(state, session_id) is called inside _state_lock to atomically
     update state after a successful reply.
     notify_user_id: Slack user ID to @mention in the reply for slow tasks.
+    log_tag: short string appended to Claude's log lines (permalink + excerpt)
+    so `tail -f` and `bridge.py status` show what is actually running.
     """
     global _messages_processed
     try:
         _record_invocation()
         start_time = time.time()
-        response = invoke_claude(prompt, session_id, resume=resume, thread_id=thread_ts)
+        response = invoke_claude(prompt, session_id, resume=resume, thread_id=thread_ts, log_tag=log_tag)
 
         # Retry fresh if resume failed
         if resume and "[Claude exited with code" in response and make_retry_prompt:
             log.warning("Resume failed for session %s, retrying fresh", session_id[:8])
             session_id = str(uuid.uuid4())
-            response = invoke_claude(make_retry_prompt(), session_id, resume=False, thread_id=thread_ts)
+            response = invoke_claude(make_retry_prompt(), session_id, resume=False, thread_id=thread_ts, log_tag=log_tag)
 
         elapsed = time.time() - start_time
 
@@ -1347,20 +1355,24 @@ def _async_invoke_and_reply(
             if success:
                 log.info("Sent DM fallback to %s", notify_user_id)
         if success:
-            log.info("Replied in %s thread %s (session=%s, %.1fs)", channel_id, thread_ts, session_id[:8], elapsed)
+            log.info("done session=%s elapsed=%.1fs%s",
+                     session_id[:8], elapsed, f" {log_tag}" if log_tag else "")
             mcp_add_reaction(token, channel_id, msg_ts, "white_check_mark")
             with _state_lock:
                 state = load_slack_state()
                 on_success(state, session_id)
                 save_slack_state(state)
         else:
-            log.error("Failed to reply in %s thread %s (reply_len=%d)", channel_id, thread_ts, len(reply_text))
+            log.error("failed session=%s elapsed=%.1fs reply_len=%d%s",
+                      session_id[:8], elapsed, len(reply_text),
+                      f" {log_tag}" if log_tag else "")
 
         _messages_processed += 1
     except Exception:
         log.exception("Error in async invocation (session=%s)", session_id[:8])
     finally:
         _unmark_inflight(msg_ts)
+        _inflight_drop(msg_ts)
 
 
 # ---------------------------------------------------------------------------
@@ -2328,6 +2340,54 @@ def _notify_bot_error(summary: str, user_id: str = "") -> bool:
         return False
 
 
+def _resolve_permalink(user_token: str, channel_id: str, ts: str) -> str:
+    """Best-effort chat.getPermalink. Tries bot token first, falls back to user token. Empty on failure."""
+    for tok in (SLACK_BOT_TOKEN, user_token):
+        if not tok:
+            continue
+        try:
+            result = _slack_api(
+                "chat.getPermalink",
+                {"channel": channel_id, "message_ts": ts},
+                tok, timeout=5,
+            )
+            if result.get("ok"):
+                return result.get("permalink", "") or ""
+        except Exception:
+            continue
+    return ""
+
+
+# ---- In-flight tracking (powers `bridge.py status`) -------------------------
+
+
+def _inflight_put(msg_ts: str, entry: dict) -> None:
+    with _inflight_file_lock:
+        try:
+            data = json.loads(INFLIGHT_FILE.read_text()) if INFLIGHT_FILE.exists() else {}
+        except (json.JSONDecodeError, ValueError):
+            data = {}
+        data[msg_ts] = entry
+        INFLIGHT_FILE.write_text(json.dumps(data, indent=2))
+
+
+def _inflight_drop(msg_ts: str) -> None:
+    with _inflight_file_lock:
+        try:
+            data = json.loads(INFLIGHT_FILE.read_text()) if INFLIGHT_FILE.exists() else {}
+        except (json.JSONDecodeError, ValueError):
+            return
+        if data.pop(msg_ts, None) is not None:
+            INFLIGHT_FILE.write_text(json.dumps(data, indent=2))
+
+
+def _inflight_read() -> dict:
+    try:
+        return json.loads(INFLIGHT_FILE.read_text())
+    except (FileNotFoundError, json.JSONDecodeError, ValueError):
+        return {}
+
+
 def slack_post_message_direct(token: str, channel_id: str, thread_ts: str, message: str) -> bool:
     """Post via user token + chat.postMessage REST. Used as a fallback when MCP blocks the send."""
     result = _slack_api(
@@ -3195,10 +3255,26 @@ def _dispatch_cross_channel_message(token: str, state: dict, msg: dict,
     resume = session_key in thread_sessions
     session_id = thread_sessions[session_key] if resume else str(uuid.uuid4())
 
+    permalink = _resolve_permalink(token, channel_id, ts)
+    excerpt = text[:80].replace("\n", " ")
+    log_tag = f"url={permalink or '<no-permalink>'} excerpt={excerpt!r}"
+
     log.info(
-        "Dispatch %s (channel=%s, session=%s, resume=%s, reply=%s, dm=%s): %.80s",
-        source, channel_id, session_id[:8], resume, is_thread_reply, is_dm, text,
+        "processing session=%s source=%s reply=%s dm=%s %s",
+        session_id[:8], source, is_thread_reply, is_dm, log_tag,
     )
+    _inflight_put(ts, {
+        "session": session_id,
+        "channel_id": channel_id,
+        "thread_ts": thread_ts,
+        "is_thread_reply": is_thread_reply,
+        "is_dm": is_dm,
+        "permalink": permalink,
+        "excerpt": excerpt,
+        "user_id": msg.get("user_id", ""),
+        "source": source,
+        "started_at": time.time(),
+    })
 
     no_post_rule = (
         f"SLACK POSTING RULE: Your text response will be automatically posted to "
@@ -3265,6 +3341,7 @@ def _dispatch_cross_channel_message(token: str, state: dict, msg: dict,
         token, channel_id, thread_ts, ts,
         prompt, session_id, resume, _on_success, _make_retry,
         notify_user_id=msg.get("user_id", ""),
+        log_tag=log_tag,
     )
     return True
 
@@ -3628,6 +3705,32 @@ def show_status():
                 print(f"  Token expires: {exp_dt.isoformat()} ({remaining})")
     else:
         print("  Token: MISSING or EXPIRED")
+
+    # In-flight Claude invocations
+    print("\n[In-flight]")
+    entries = _inflight_read()
+    if not entries:
+        print("  (idle - no Claude invocations currently running)")
+    else:
+        now = time.time()
+        print(f"  {len(entries)} running:")
+        # Sort longest-running first so stuck work bubbles up
+        items = sorted(entries.items(), key=lambda kv: kv[1].get("started_at", now))
+        for ts, e in items:
+            started = e.get("started_at", now)
+            elapsed = int(now - started)
+            mm, ss = divmod(elapsed, 60)
+            hh, mm = divmod(mm, 60)
+            clock = f"{hh}h{mm:02d}m{ss:02d}s" if hh else f"{mm}m{ss:02d}s"
+            src = e.get("source", "?")
+            sid = e.get("session", "")[:8]
+            where = f"<#{e.get('channel_id', '?')}>"
+            if e.get("is_dm"):
+                where = "(DM)"
+            excerpt = e.get("excerpt", "")[:60]
+            permalink = e.get("permalink", "") or "(no permalink)"
+            print(f"  - {sid}  {clock:>8s}  {src:6s}  {where:22s}  {excerpt!r}")
+            print(f"    {permalink}")
 
 
 # ---------------------------------------------------------------------------
