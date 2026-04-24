@@ -86,7 +86,7 @@ SCOPES = [
     "https://www.googleapis.com/auth/gmail.send",
 ]
 
-POLL_INTERVAL = int(os.environ.get("CLAUDE_REMOTE_POLL_INTERVAL", "15"))
+POLL_INTERVAL = int(os.environ.get("CLAUDE_REMOTE_POLL_INTERVAL", "5"))
 CLAUDE_TIMEOUT = int(os.environ.get("CLAUDE_REMOTE_TIMEOUT", "3600"))  # seconds (default 60 min)
 CLAUDE_SOFT_CAP_BUFFER = int(os.environ.get("CLAUDE_REMOTE_SOFT_CAP_BUFFER", "600"))  # soft cap = timeout - buffer (default 10 min before)
 MAX_RESPONSE_LEN = 50_000  # chars
@@ -3118,132 +3118,10 @@ def slack_cross_channel_cycle(token: str, state: dict):
 
     # 3. Submit each to thread pool
     for msg in to_process:
-        allowed, remaining = _check_rate_limit()
-        if not allowed:
-            # Remember the ts so we (a) stop log-spamming and (b) pick it up
-            # automatically on the next poll cycle that has budget.
-            if msg["ts"] not in _DEFERRED_MENTIONS:
-                _DEFERRED_MENTIONS.add(msg["ts"])
-                log.warning(
-                    "Rate limit reached (%d/hr). Deferred %s in %s until budget frees.",
-                    RATE_LIMIT_PER_HOUR, msg["ts"], msg.get("channel_id", "?"),
-                )
-            break
-        _DEFERRED_MENTIONS.discard(msg["ts"])
-
-        # Strip every known trigger form (keyword, raw bot mention, @username)
-        text = msg.get("text", "")
-        for tok in strip_tokens:
-            text = text.replace(tok, "")
-        text = text.strip()
-        if not text:
-            processed.add(msg["ts"])
+        if _dispatch_cross_channel_message(token, state, msg, processed, strip_tokens, source="poll"):
             continue
-
-        channel_id = msg["channel_id"]
-        is_thread_reply = bool(msg.get("thread_ts"))
-        thread_ts = msg.get("thread_ts") or msg["ts"]
-
-        # Acknowledge receipt
-        mcp_add_reaction(token, channel_id, msg["ts"], "eyes")
-
-        # Fetch the full thread (parent + all replies, including prior bot
-        # responses) so follow-ups like "yes, go with A" have context.
-        thread_context = mcp_read_thread(token, channel_id, thread_ts) or ""
-
-        # Expand up to 3 Slack permalinks in the thread so references to other
-        # threads/messages come along. Skip the thread we just fetched.
-        link_context = _expand_slack_permalinks(
-            token,
-            thread_context + "\n" + text,
-            skip={(channel_id, thread_ts)},
-        )
-
-        # Resume an existing Claude session for this (channel, thread_ts) if one
-        # exists, so replies in the same thread carry implicit memory across
-        # cross-channel invocations.
-        session_key = f"{channel_id}:{thread_ts}"
-        thread_sessions = state.get("thread_sessions", {})
-        resume = session_key in thread_sessions
-        if resume:
-            session_id = thread_sessions[session_key]
-        else:
-            session_id = str(uuid.uuid4())
-
-        log.info(
-            "Cross-channel submitting (channel=%s, session=%s, resume=%s, reply=%s): %.80s",
-            channel_id, session_id[:8], resume, is_thread_reply, text,
-        )
-
-        # Build prompt with posting scope restriction + thread context + link context
-        no_post_rule = (
-            f"SLACK POSTING RULE: Your text response will be automatically posted to "
-            f"channel {channel_id}, thread {thread_ts}. Do NOT use slack_send_message to "
-            f"post in this same channel/thread (it will double-post). However, you MAY use "
-            f"slack_send_message to DM other users or post in OTHER channels when the user "
-            f"explicitly asks you to. You may use all Slack read/search tools freely."
-        )
-        context_instruction = (
-            "Before answering, read the FULL thread below - including prior replies from "
-            ":robot_face: (that is you in an earlier turn). If the latest message refers to "
-            "earlier content (e.g. 'option A', 'that link'), ground your answer in what was "
-            "actually said above. If any URLs (Confluence/Sigma/Chronosphere/Jira/etc.) or "
-            "Slack permalinks in the thread are relevant and not already expanded below, "
-            "use WebFetch, mcp__plugin_jira, or the appropriate MCP tool to read them before "
-            "responding."
-        )
-
-        def _build_prompt(t: str, tc: str, lc: str) -> str:
-            role = (
-                "You are replying in an existing Slack thread."
-                if is_thread_reply
-                else "You are responding to a Slack message that tagged you."
-            )
-            parts: list[str] = [no_post_rule, "", role, "", context_instruction, ""]
-            parts.append(f"Channel: <#{channel_id}>")
-            parts.append(f"Thread ts: {thread_ts}")
-            if tc:
-                parts.append("")
-                parts.append("=== Full thread context ===")
-                parts.append(tc)
-                parts.append("=== End of thread ===")
-            if lc:
-                parts.append("")
-                parts.append("=== Linked Slack threads (already expanded) ===")
-                parts.append(lc)
-                parts.append("=== End of linked threads ===")
-            parts.append("")
-            parts.append(f"The user's latest message is: {t}")
-            parts.append("")
-            parts.append(
-                "Respond with Slack mrkdwn formatting (*bold*, _italic_, `code`). "
-                "Be concise and helpful. Do NOT repeat prior analysis verbatim - "
-                "build on it."
-            )
-            return "\n".join(parts)
-
-        prompt = _build_prompt(text, thread_context, link_context)
-
-        _msg_ts = msg["ts"]
-        _session_key = session_key
-
-        def _on_success(st, sid, mts=_msg_ts, sk=_session_key):
-            ids = set(st.get("search_processed_ids", []))
-            ids.add(mts)
-            st["search_processed_ids"] = list(ids)[-500:]
-            st.setdefault("thread_sessions", {})[sk] = sid
-
-        def _make_retry(t=text, tc=thread_context, lc=link_context, build=_build_prompt):
-            return build(t, tc, lc)
-
-        processed.add(msg["ts"])
-        _mark_inflight(msg["ts"])
-        _executor.submit(
-            _async_invoke_and_reply,
-            token, channel_id, thread_ts, msg["ts"],
-            prompt, session_id, resume, _on_success, _make_retry,
-            notify_user_id=msg.get("user_id", ""),
-        )
+        # Rate-limited - further submissions will also fail this cycle
+        break
 
     # 4. Save processed IDs
     with _state_lock:
@@ -3252,6 +3130,143 @@ def slack_cross_channel_cycle(token: str, state: dict):
         existing.update(processed)
         state["search_processed_ids"] = list(existing)[-500:]
         save_slack_state(state)
+
+
+def _dispatch_cross_channel_message(token: str, state: dict, msg: dict,
+                                    processed: set, strip_tokens: list,
+                                    source: str = "poll") -> bool:
+    """Run rate-limit + context + prompt + submit for a single mention.
+
+    Returns True if accepted (submitted or skipped for a benign reason like
+    empty-after-strip), False if deferred by rate limit. Shared by the poll
+    cycle and the Socket Mode listener; dedupes via _inflight + processed set.
+    """
+    ts = msg.get("ts")
+    if not ts:
+        return True
+
+    if _is_inflight(ts) or ts in processed:
+        return True
+
+    allowed, _ = _check_rate_limit()
+    if not allowed:
+        if ts not in _DEFERRED_MENTIONS:
+            _DEFERRED_MENTIONS.add(ts)
+            log.warning(
+                "Rate limit reached (%d/hr). Deferred %s in %s until budget frees.",
+                RATE_LIMIT_PER_HOUR, ts, msg.get("channel_id", "?"),
+            )
+        return False
+    _DEFERRED_MENTIONS.discard(ts)
+
+    # Strip every known trigger form (keyword, raw bot mention, @username)
+    text = msg.get("text", "")
+    for tok in strip_tokens:
+        text = text.replace(tok, "")
+    text = text.strip()
+    if not text:
+        processed.add(ts)
+        return True
+
+    channel_id = msg["channel_id"]
+    is_thread_reply = bool(msg.get("thread_ts"))
+    thread_ts = msg.get("thread_ts") or ts
+    is_dm = channel_id.startswith("D")
+
+    # Acknowledge receipt
+    mcp_add_reaction(token, channel_id, ts, "eyes")
+
+    # Fetch the full thread (parent + all replies, including prior bot
+    # responses) so follow-ups like "yes, go with A" have context.
+    thread_context = mcp_read_thread(token, channel_id, thread_ts) or ""
+
+    # Expand up to 3 Slack permalinks in the thread so references to other
+    # threads/messages come along. Skip the thread we just fetched.
+    link_context = _expand_slack_permalinks(
+        token,
+        thread_context + "\n" + text,
+        skip={(channel_id, thread_ts)},
+    )
+
+    # Resume an existing Claude session for this (channel, thread_ts) so
+    # replies in the same thread / DM carry implicit memory.
+    session_key = f"{channel_id}:{thread_ts}"
+    thread_sessions = state.get("thread_sessions", {})
+    resume = session_key in thread_sessions
+    session_id = thread_sessions[session_key] if resume else str(uuid.uuid4())
+
+    log.info(
+        "Dispatch %s (channel=%s, session=%s, resume=%s, reply=%s, dm=%s): %.80s",
+        source, channel_id, session_id[:8], resume, is_thread_reply, is_dm, text,
+    )
+
+    no_post_rule = (
+        f"SLACK POSTING RULE: Your text response will be automatically posted to "
+        f"channel {channel_id}, thread {thread_ts}. Do NOT use slack_send_message to "
+        f"post in this same channel/thread (it will double-post). However, you MAY use "
+        f"slack_send_message to DM other users or post in OTHER channels when the user "
+        f"explicitly asks you to. You may use all Slack read/search tools freely."
+    )
+    context_instruction = (
+        "Before answering, read the FULL thread below - including prior replies from "
+        ":robot_face: (that is you in an earlier turn). If the latest message refers to "
+        "earlier content (e.g. 'option A', 'that link'), ground your answer in what was "
+        "actually said above. If any URLs (Confluence/Sigma/Chronosphere/Jira/etc.) or "
+        "Slack permalinks in the thread are relevant and not already expanded below, "
+        "use WebFetch, mcp__plugin_jira, or the appropriate MCP tool to read them before "
+        "responding."
+    )
+
+    def _build_prompt(t: str, tc: str, lc: str) -> str:
+        if is_dm:
+            role = "You are responding to a DM sent directly to you."
+        elif is_thread_reply:
+            role = "You are replying in an existing Slack thread."
+        else:
+            role = "You are responding to a Slack message that tagged you."
+        parts: list[str] = [no_post_rule, "", role, "", context_instruction, ""]
+        parts.append(f"Channel: <#{channel_id}>")
+        parts.append(f"Thread ts: {thread_ts}")
+        if tc:
+            parts.append("")
+            parts.append("=== Full thread context ===")
+            parts.append(tc)
+            parts.append("=== End of thread ===")
+        if lc:
+            parts.append("")
+            parts.append("=== Linked Slack threads (already expanded) ===")
+            parts.append(lc)
+            parts.append("=== End of linked threads ===")
+        parts.append("")
+        parts.append(f"The user's latest message is: {t}")
+        parts.append("")
+        parts.append(
+            "Respond with Slack mrkdwn formatting (*bold*, _italic_, `code`). "
+            "Be concise and helpful. Do NOT repeat prior analysis verbatim - "
+            "build on it."
+        )
+        return "\n".join(parts)
+
+    prompt = _build_prompt(text, thread_context, link_context)
+
+    def _on_success(st, sid, mts=ts, sk=session_key):
+        ids = set(st.get("search_processed_ids", []))
+        ids.add(mts)
+        st["search_processed_ids"] = list(ids)[-500:]
+        st.setdefault("thread_sessions", {})[sk] = sid
+
+    def _make_retry(t=text, tc=thread_context, lc=link_context, build=_build_prompt):
+        return build(t, tc, lc)
+
+    processed.add(ts)
+    _mark_inflight(ts)
+    _executor.submit(
+        _async_invoke_and_reply,
+        token, channel_id, thread_ts, ts,
+        prompt, session_id, resume, _on_success, _make_retry,
+        notify_user_id=msg.get("user_id", ""),
+    )
+    return True
 
 
 # ---------------------------------------------------------------------------
